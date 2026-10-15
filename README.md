@@ -70,6 +70,16 @@
 **배포(flet build / flet pack)**
 - 폰트 등 리소스는 `assets/` → 배포 번들에 포함 (`flet pack main.py --add-data "assets:assets"`)
 - 결과물·업로드·로그는 배포 앱에서 운영체제의 앱 데이터 폴더(`FLET_APP_STORAGE_DATA`)에 저장 (설치 폴더는 읽기 전용)
+- 배포 설정은 `pyproject.toml`(`[tool.flet]`), 배포 앱 의존성은 `[project].dependencies` (웹 서버 패키지 제외)
+- 배포 앱(`FLET_PLATFORM` 설정됨)은 `FLET_VIEW`와 관계없이 항상 데스크톱 앱으로 실행
+
+**Windows 배포 자동 빌드 (GitHub Actions: `.github/workflows/build-windows.yml`)**
+- `main` 푸시·PR·수동 실행(Actions → Build Windows → Run workflow): 빌드된 zip을 Actions 실행 결과의 Artifacts에서 다운로드
+- `v*` 태그 푸시 시 GitHub Release에 zip 자동 첨부: `git tag v1.0.0 && git push origin v1.0.0` (태그 숫자가 앱 버전이 됨)
+- 결과물 `AnmasarangStudio-windows-x64-<버전>.zip`: 압축을 풀고 `AnmasarangStudio.exe` 실행 (x64, ARM 윈도우에서도 동작)
+- FFmpeg/ffprobe(gyan.dev essentials 빌드, GPL)를 `ffmpeg\` 폴더에 함께 배포 → 사용자 PC에 FFmpeg 설치 불필요
+- 로컬 빌드: `powershell -ExecutionPolicy Bypass -File .\build_windows.ps1` (Visual Studio 2022 "C++를 사용한 데스크톱 개발" 필요, Flutter SDK는 자동 설치)
+- 비공개 예시 데이터(`data/`)는 배포 번들에서 제외
 
 ---
 

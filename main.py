@@ -20,7 +20,7 @@ from views.left_input_panel import LeftInputPanel
 from views.center_editor_panel import CenterEditorPanel
 from views.right_preview_panel import RightPreviewPanel
 
-from services.paths import BASE_DIR, ASSETS_DIR, FONTS_DIR, EXPORTS_DIR, UPLOAD_DIR, LOG_DIR
+from services.paths import BASE_DIR, ASSETS_DIR, FONTS_DIR, EXPORTS_DIR, UPLOAD_DIR, LOG_DIR, IS_PACKAGED
 
 # 경로 규칙 (services/paths.py)
 # - assets/ : 폰트 등 읽기 전용 리소스 → Flet assets_dir (배포 번들에 포함)
@@ -364,7 +364,8 @@ def create_web_app():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8550"))
     view_mode = os.environ.get("FLET_VIEW", "web").lower()
-    if view_mode == "app":
+    # flet build 배포 앱은 항상 데스크톱 앱으로 실행 (웹 서버 모드 X)
+    if view_mode == "app" or IS_PACKAGED:
         ft.run(main, view=ft.AppView.FLET_APP, assets_dir=ASSETS_DIR, upload_dir=UPLOAD_DIR)
     else:
         import uvicorn

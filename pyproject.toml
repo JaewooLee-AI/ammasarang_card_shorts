@@ -1,0 +1,43 @@
+# Flet 배포 설정 (flet build windows 등)
+# - 개발 실행용 의존성은 requirements.txt (웹 모드 서버 포함)
+# - 아래 dependencies는 배포 앱 번들에 들어가는 런타임 의존성만 (웹 서버·flet-desktop 제외)
+[project]
+name = "anmasarang-studio"
+version = "1.0.0"
+description = "안마사랑 AI 콘텐츠 스튜디오 - 카드뉴스 & 쇼츠/릴스 생성기"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "flet==1.0.4",
+    "flet-video==1.0.4",
+    "google-genai==2.31.0",
+    "anthropic==1.14.0",
+    "pydantic==2.14.1",
+    "pillow==12.3.0",
+    "Jinja2==3.1.6",
+    "gTTS==2.5.4",
+]
+
+[tool.flet]
+org = "com.anmasarang"
+product = "안마사랑 AI 콘텐츠 스튜디오"
+artifact = "AnmasarangStudio"   # 실행 파일 이름 (AnmasarangStudio.exe)
+company = "안마사랑"
+copyright = "Copyright (C) 2026 안마사랑"
+
+[tool.flet.app]
+path = "."
+module = "main"
+# 배포 번들에서 제외: 문서·스크립트, 실행 중 생기는 결과물, 비공개 예시 데이터(data/), 빌드 산출물
+exclude = [
+    "README.md",
+    "Flet AI 콘텐츠 앱 아키텍처.md",
+    "run.sh",
+    "build_windows.ps1",
+    "requirements.txt",
+    "build",
+    "dist",
+    "data",
+    "exports",
+    "uploads",
+    "logs",
+]

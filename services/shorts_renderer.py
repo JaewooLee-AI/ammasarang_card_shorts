@@ -61,7 +61,7 @@ class ShortsRendererService:
         if not scenes:
             raise ValueError("내레이션이 있는 쇼츠 씬이 없습니다.")
         if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
-            raise RuntimeError("ffmpeg/ffprobe가 설치되어 있지 않습니다. (macOS: brew install ffmpeg)")
+            raise RuntimeError("ffmpeg/ffprobe가 설치되어 있지 않습니다. (macOS: brew install ffmpeg / Windows: winget install Gyan.FFmpeg)")
 
         self.last_warnings = []
         self.options = options or ShortsOptions()

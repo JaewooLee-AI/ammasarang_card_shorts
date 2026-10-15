@@ -1,0 +1,109 @@
+# Windows 데스크톱 앱 자동 빌드 (flet build windows)
+# - main 푸시 / PR / 수동 실행: 빌드 후 Actions 아티팩트(zip)로 업로드
+# - v* 태그 푸시(예: v1.0.0): 빌드 후 GitHub Release에 zip 첨부
+# 결과물: AnmasarangStudio-windows-x64-<버전>.zip (AnmasarangStudio.exe + ffmpeg 포함, 압축 풀고 바로 실행)
+name: Build Windows
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore: ["**.md", "run.sh"]
+  pull_request:
+    branches: [main]
+    paths-ignore: ["**.md", "run.sh"]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 태그 빌드 시 Release 생성
+
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+  FLET_CLI_VERSION: "1.0.4"
+  # 함께 배포하는 FFmpeg (쇼츠 렌더링·영상 썸네일에 필요) — gyan.dev 공식 빌드의 고정 버전
+  FFMPEG_VERSION: "7.1.1"
+  FLET_CLI_NO_RICH_OUTPUT: "1"
+  PYTHONIOENCODING: "utf-8"
+  PYTHONUTF8: "1"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 버전 결정
+        id: ver
+        run: |
+          $ref = "${{ github.ref_name }}"
+          if ("${{ github.ref_type }}" -eq "tag" -and $ref -match '^v(\d+\.\d+\.\d+)') {
+            $version = $Matches[1]
+          } else {
+            $version = (python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "Build version: $version (build ${{ github.run_number }})"
+
+      # Flet이 요구하는 Flutter SDK를 직접 내려받으므로 캐시해 두면 다음 빌드가 빨라짐
+      - name: Flutter SDK 캐시
+        uses: actions/cache@v4
+        with:
+          path: ~/flutter
+          key: flet-flutter-${{ runner.os }}-${{ env.FLET_CLI_VERSION }}
+
+      - name: flet-cli 설치
+        run: python -m pip install --upgrade pip "flet-cli==${{ env.FLET_CLI_VERSION }}"
+
+      - name: flet build windows
+        run: >
+          flet build windows --yes --no-rich-output -v
+          --build-version ${{ steps.ver.outputs.version }}
+          --build-number ${{ github.run_number }}
+
+      - name: FFmpeg 번들 추가
+        run: |
+          $zip = "$env:RUNNER_TEMP\ffmpeg.zip"
+          $url = "https://github.com/GyanD/codexffmpeg/releases/download/${{ env.FFMPEG_VERSION }}/ffmpeg-${{ env.FFMPEG_VERSION }}-essentials_build.zip"
+          Invoke-WebRequest $url -OutFile $zip
+          Expand-Archive $zip "$env:RUNNER_TEMP\ffmpeg"
+          $src = Get-ChildItem "$env:RUNNER_TEMP\ffmpeg" -Directory | Select-Object -First 1
+          $dst = "build\windows\ffmpeg"
+          New-Item -ItemType Directory -Force $dst | Out-Null
+          Copy-Item "$($src.FullName)\bin\ffmpeg.exe", "$($src.FullName)\bin\ffprobe.exe" $dst
+          Copy-Item "$($src.FullName)\LICENSE" "$dst\LICENSE.txt"
+          & "$dst\ffmpeg.exe" -hide_banner -version | Select-Object -First 1
+
+      - name: 압축
+        id: pkg
+        run: |
+          if (-not (Test-Path "build\windows\AnmasarangStudio.exe")) { throw "AnmasarangStudio.exe가 없습니다: $(Get-ChildItem build\windows -Name)" }
+          $name = "AnmasarangStudio-windows-x64-${{ steps.ver.outputs.version }}"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path "build\windows\*" -DestinationPath "dist\$name.zip"
+          "name=$name" >> $env:GITHUB_OUTPUT
+          Get-Item "dist\$name.zip" | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: dist/${{ steps.pkg.outputs.name }}.zip
+          retention-days: 30
+
+      - name: GitHub Release 첨부 (태그 빌드)
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ steps.pkg.outputs.name }}.zip
+          generate_release_notes: true

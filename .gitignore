@@ -23,3 +23,7 @@ data/scenarios.json
 
 # flet run 개발 모드 저장소
 .flet/
+
+# flet build 산출물
+build/
+dist/
