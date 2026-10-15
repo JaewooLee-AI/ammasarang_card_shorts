@@ -1,0 +1,12 @@
+flet==1.0.4
+flet-desktop==1.0.4
+flet-web==1.0.4
+flet-video==1.0.4
+fastapi==0.143.1
+uvicorn==0.54.0
+google-genai==2.31.0
+anthropic==1.14.0
+pydantic==2.14.1
+pillow==12.3.0
+Jinja2==3.1.6
+gTTS==2.5.4

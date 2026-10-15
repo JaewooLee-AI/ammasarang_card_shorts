@@ -1,0 +1,22 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# 생성 결과물 · 업로드 · 로그 (앱 실행 시 자동 생성)
+exports/
+uploads/
+logs/
+
+# API 키 등 로컬 비밀값 (앱은 ~/.anmasarang_studio/keys.json 사용)
+.env
+.env.*
+keys.json
+
+# 테스트·OS 부산물
+.playwright-mcp/
+.DS_Store
+
+# 비공개 사업 데이터 (예시 시나리오)
+data/scenarios.json

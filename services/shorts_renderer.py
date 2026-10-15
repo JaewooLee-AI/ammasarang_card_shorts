@@ -1,0 +1,685 @@
+import logging
+import os
+import re
+import shutil
+import asyncio
+import subprocess
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple
+from PIL import Image, ImageDraw, ImageFilter, ImageOps
+from models.schema import ShortsScene, EditableStoryboard, MediaAsset
+from services.fonts import korean_font, wrap_text_px, text_height
+
+HOTLINE = "1577-1398"
+SCENE_GAP = 0.3  # 씬 사이 호흡(초)
+
+
+class ShortsRendererService:
+    """쇼츠/릴스 (9:16, 1080x1920) 비디오 렌더링 서비스
+
+    파이프라인: 씬별 TTS → 단어 타임라인 산출 → 씬별 영상 세그먼트(첨부 영상 구간 9:16 변환 /
+    이미지 켄 번스 / 브랜드 배경) → 자막·타이틀 오버레이 PNG 시퀀스(Pillow) → FFmpeg 최종 인코딩.
+    자막을 Pillow로 직접 그리므로 libass가 없는 FFmpeg 빌드에서도 자막이 입혀진다.
+    `captions.ass`는 편집 툴용 사이드카 파일로 함께 저장한다.
+    """
+
+    WIDTH = 1080
+    HEIGHT = 1920
+    FPS = 30
+    SECTION_LABELS = {"hook": "오프닝", "body": "핵심 포인트", "conclusion": "마무리"}
+
+    def __init__(self, export_dir: str = None):
+        if not export_dir:
+            base_dir = os.path.dirname(os.path.dirname(__file__))
+            self.export_dir = os.path.join(base_dir, "exports", "shorts")
+        else:
+            self.export_dir = export_dir
+        os.makedirs(self.export_dir, exist_ok=True)
+        self.last_warnings: List[str] = []
+        self._has_yuna: Optional[bool] = None
+
+    # ------------------------------------------------------------------
+    # 진입점
+    # ------------------------------------------------------------------
+    async def render_shorts_video(self, storyboard: EditableStoryboard, progress_callback=None) -> str:
+        scenes = [s for s in storyboard.shorts_scenes if (s.narration_script or "").strip()]
+        if not scenes:
+            raise ValueError("내레이션이 있는 쇼츠 씬이 없습니다.")
+        if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+            raise RuntimeError("ffmpeg/ffprobe가 설치되어 있지 않습니다. (macOS: brew install ffmpeg)")
+
+        self.last_warnings = []
+        output_mp4 = os.path.join(self.export_dir, "final_shorts.mp4")
+        audio_path = os.path.join(self.export_dir, "combined_narration.mp3")
+        ass_path = os.path.join(self.export_dir, "captions.ass")
+        bg_path = os.path.join(self.export_dir, "shorts_bg.png")
+        work_dir = os.path.join(self.export_dir, "_work")
+        shutil.rmtree(work_dir, ignore_errors=True)
+        os.makedirs(work_dir)
+
+        async def progress(pct: float, msg: str):
+            if progress_callback:
+                await progress_callback(pct, msg)
+
+        try:
+            await progress(0.1, "씬별 한국어 내레이션 음성 합성 중...")
+            scene_timeline, total_duration = await self._synthesize_scenes(scenes, work_dir, audio_path)
+
+            await progress(0.4, "단어별 하이라이트 자막 타임라인 계산 중...")
+            events = self._build_caption_events(scene_timeline, total_duration)
+            self._build_karaoke_ass_file(events, Path(ass_path))
+
+            await progress(0.5, "씬별 영상 트랙 구성 중 (첨부 영상 트림·9:16 변환, 이미지 모션)...")
+            await asyncio.to_thread(self._generate_vertical_background, bg_path)
+            video_track, media_flags = await self._build_video_track(storyboard, scene_timeline, work_dir, bg_path)
+
+            await progress(0.65, "자막·타이틀 오버레이 프레임 생성 중...")
+            concat_path = await asyncio.to_thread(
+                self._render_overlay_sequence, storyboard.title, scene_timeline, events, total_duration, work_dir, media_flags
+            )
+
+            await progress(0.8, "FFmpeg H.264 최종 인코딩 중 (영상 + 자막 + 내레이션)...")
+            await self._run_ffmpeg_encode(video_track, concat_path, audio_path, output_mp4, total_duration)
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+        await progress(1.0, "쇼츠 렌더링 완료!")
+        return output_mp4
+
+    # ------------------------------------------------------------------
+    # 1. 음성 합성 (씬 단위)
+    # ------------------------------------------------------------------
+    def _yuna_available(self) -> bool:
+        if self._has_yuna is None:
+            try:
+                out = subprocess.run(["say", "-v", "?"], capture_output=True, text=True, timeout=10).stdout
+                self._has_yuna = any(line.startswith("Yuna") for line in out.splitlines())
+            except Exception:
+                self._has_yuna = False
+        return self._has_yuna
+
+    def _tts_scene(self, text: str, out_base: str, est_duration: float) -> Tuple[str, str]:
+        """(오디오 경로, 사용 엔진) — macOS Yuna → gTTS → 무음 순으로 시도"""
+        if shutil.which("say") and self._yuna_available():
+            aiff = out_base + ".aiff"
+            res = subprocess.run(["say", "-v", "Yuna", "-o", aiff, text], capture_output=True, text=True)
+            if res.returncode == 0 and os.path.exists(aiff) and os.path.getsize(aiff) > 0:
+                return aiff, "yuna"
+        try:
+            from gtts import gTTS
+            mp3 = out_base + ".mp3"
+            gTTS(text=text, lang="ko", slow=False).save(mp3)
+            if os.path.getsize(mp3) > 0:
+                return mp3, "gtts"
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"{e}")
+        wav = out_base + ".wav"
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                        "-t", f"{est_duration:.2f}", wav], check=True)
+        return wav, "silent"
+
+    async def _synthesize_scenes(self, scenes: List[ShortsScene], work_dir: str, audio_path: str):
+        timeline: List[Dict[str, Any]] = []
+        engines = set()
+        files = []
+        for i, scene in enumerate(scenes):
+            text = scene.narration_script.strip()
+            path, engine = await asyncio.to_thread(
+                self._tts_scene, text, os.path.join(work_dir, f"scene_{i:02d}"), max(1.0, scene.duration_seconds)
+            )
+            engines.add(engine)
+            dur = await self._get_audio_duration(path)
+            if dur <= 0:
+                dur = max(1.0, scene.duration_seconds)
+            files.append(path)
+            timeline.append({"scene": scene, "speech": dur})
+
+        if "silent" in engines:
+            self.last_warnings.append("음성 합성 실패 구간은 무음 처리됨")
+        elif "gtts" in engines:
+            self.last_warnings.append("macOS Yuna 음성 없음 → gTTS 사용")
+
+        # 씬 오디오 이어붙이기 (씬 사이 SCENE_GAP초 여백)
+        inputs, filters = [], []
+        for idx, f in enumerate(files):
+            inputs += ["-i", f]
+            pad = f",apad=pad_dur={SCENE_GAP}" if idx < len(files) - 1 else ""
+            filters.append(f"[{idx}:a]aformat=sample_rates=44100:channel_layouts=stereo{pad}[a{idx}]")
+        concat = "".join(f"[a{i}]" for i in range(len(files))) + f"concat=n={len(files)}:v=0:a=1[out]"
+        cmd = ["ffmpeg", "-y", "-v", "error", *inputs, "-filter_complex", ";".join(filters + [concat]),
+               "-map", "[out]", "-c:a", "libmp3lame", "-b:a", "192k", audio_path]
+        await self._run(cmd, "내레이션 오디오 결합 실패")
+
+        t = 0.0
+        for idx, item in enumerate(timeline):
+            item["start"] = t
+            item["end"] = t + item["speech"] + (SCENE_GAP if idx < len(timeline) - 1 else 0.0)
+            t = item["end"]
+        total = await self._get_audio_duration(audio_path)
+        return timeline, max(total, t)
+
+    async def _get_audio_duration(self, path: str) -> float:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", path,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        try:
+            return float(stdout.decode().strip())
+        except ValueError:
+            return 0.0
+
+    # ------------------------------------------------------------------
+    # 2. 자막 이벤트 (단어별 하이라이트)
+    # ------------------------------------------------------------------
+    def _build_caption_events(self, timeline: List[Dict[str, Any]], total: float) -> List[Dict[str, Any]]:
+        """씬마다 실제 음성 길이 안에서 글자 수(+문장부호 쉼) 비례로 단어 시간을 배분"""
+        events: List[Dict[str, Any]] = []
+        for s_idx, item in enumerate(timeline):
+            words = item["scene"].narration_script.split()
+            weights = []
+            for w in words:
+                weight = max(1, len(re.sub(r"[^\w]", "", w)))
+                if re.search(r"[.!?]$", w):
+                    weight += 2
+                elif re.search(r"[,，]$", w):
+                    weight += 1
+                weights.append(weight)
+            unit = item["speech"] / max(1, sum(weights))
+            starts, t = [], item["start"]
+            for wgt in weights:
+                starts.append(t)
+                t += wgt * unit
+
+            groups = self._group_words(words)
+            pos = 0
+            for group in groups:
+                for g_idx in range(len(group)):
+                    w_idx = pos + g_idx
+                    start = starts[w_idx]
+                    end = starts[w_idx + 1] if w_idx + 1 < len(words) else item["end"]
+                    events.append({"scene_index": s_idx, "words": group, "active": g_idx,
+                                   "start": round(start, 3), "end": round(end, 3)})
+                pos += len(group)
+        if events:
+            events[-1]["end"] = max(events[-1]["end"], total)
+        return events
+
+    def _group_words(self, words: List[str]) -> List[List[str]]:
+        """한 화면 자막이 2줄을 넘지 않도록 최대 3단어씩 묶기"""
+        font = korean_font(72, "bold")
+        groups, curr = [], []
+        for w in words:
+            trial = curr + [w]
+            if curr and (len(trial) > 3 or len(wrap_text_px(" ".join(trial), font, 900)) > 2):
+                groups.append(curr)
+                curr = [w]
+            else:
+                curr = trial
+        if curr:
+            groups.append(curr)
+        return groups
+
+    def _format_ass_time(self, seconds: float) -> str:
+        cs_total = int(round(seconds * 100))
+        hrs, rem = divmod(cs_total, 360000)
+        mins, rem = divmod(rem, 6000)
+        secs, cs = divmod(rem, 100)
+        return f"{hrs}:{mins:02d}:{secs:02d}.{cs:02d}"
+
+    def _build_karaoke_ass_file(self, events: List[Dict[str, Any]], output_ass_path: Path):
+        """편집 툴(Premiere/CapCut 등)용 ASS 사이드카 자막. 색상: &HAABBGGRR"""
+        ass_header = """[Script Info]
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Apple SD Gothic Neo,72,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,5,3,2,80,80,300,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+        lines = []
+        for ev in events:
+            parts = []
+            for i, w in enumerate(ev["words"]):
+                clean = w.replace("{", "").replace("}", "")
+                parts.append(f"{{\\c&H0000FFFF&}}{clean}{{\\r}}" if i == ev["active"] else clean)
+            lines.append(f"Dialogue: 0,{self._format_ass_time(ev['start'])},{self._format_ass_time(ev['end'])},Default,,0,0,0,,{' '.join(parts)}")
+        output_ass_path.write_text(ass_header + "\n".join(lines) + "\n", encoding="utf-8")
+
+    # ------------------------------------------------------------------
+    # 3. 영상 트랙 (씬별: 첨부 동영상 구간 / 이미지 모션 / 브랜드 배경)
+    # ------------------------------------------------------------------
+    def _generate_vertical_background(self, output_path: str):
+        """에셋이 없는 씬에 쓰는 브랜드 배경"""
+        W, H = self.WIDTH, self.HEIGHT
+        img = Image.new("RGB", (W, H), "#0F172A")
+        draw = ImageDraw.Draw(img)
+        for y in range(H):
+            t = y / H
+            draw.line([(0, y), (W, y)], fill=(int(0 + 15 * t), int(35 + 10 * t), int(111 - 69 * t)))
+        deco = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        d2 = ImageDraw.Draw(deco)
+        d2.ellipse([-260, -200, 520, 580], fill=(59, 130, 246, 60))
+        d2.ellipse([620, 1180, 1400, 1960], fill=(37, 99, 235, 50))
+        d2.ellipse([700, 300, 1100, 700], fill=(255, 184, 0, 25))
+        img = Image.alpha_composite(img.convert("RGBA"), deco).convert("RGB")
+        img.save(output_path, "PNG")
+
+    def _vertical_frame(self, src: Image.Image) -> Image.Image:
+        """임의 비율 이미지를 9:16으로: 세로에 가까우면 꽉 채워 자르고, 가로 사진은 흐린 배경 위에 원본 전체를 배치"""
+        W, H = self.WIDTH, self.HEIGHT
+        src = src.convert("RGB")
+        if src.width / src.height <= 0.75:
+            return ImageOps.fit(src, (W, H), method=Image.LANCZOS, centering=(0.5, 0.45))
+        bg = ImageOps.fit(src, (W, H), method=Image.LANCZOS).filter(ImageFilter.GaussianBlur(40))
+        bg = Image.blend(bg, Image.new("RGB", (W, H), "#0F172A"), 0.35)
+        fg = src.copy()
+        fg.thumbnail((W, H), Image.LANCZOS)
+        if fg.width < W:
+            fg = fg.resize((W, int(fg.height * W / fg.width)), Image.LANCZOS)
+        bg.paste(fg, ((W - fg.width) // 2, (H - fg.height) // 2))
+        return bg
+
+    # 씬 순서대로 돌아가며 쓰는 카메라 움직임 / 장면 전환 (같은 효과가 연속되지 않도록)
+    MOTIONS = ["zoom_in", "pan_right", "zoom_out", "pan_up", "pan_left", "diag"]
+    TRANSITIONS = ["zoomin", "smoothleft", "circleopen", "slideup", "fadewhite", "smoothup", "radial"]
+    TRANSITION_SEC = 0.4
+
+    async def _build_video_track(self, sb: EditableStoryboard, timeline: List[Dict[str, Any]], work_dir: str, bg_path: str):
+        """씬별 세그먼트를 만들고 장면 전환(xfade)으로 이어 붙인 무음 영상 트랙 1개를 반환.
+
+        전환 구간은 씬 경계를 중심으로 앞뒤 씬이 겹치도록 세그먼트를 조금씩 길게 만들어,
+        전체 길이와 씬 경계 시각이 내레이션 오디오와 프레임 단위로 일치하도록 한다.
+        """
+        fps = self.FPS
+        n = len(timeline)
+        half = max(1, round(self.TRANSITION_SEC * fps / 2))
+        segments, flags = [], []
+        for i, item in enumerate(timeline):
+            b, e = round(item["start"] * fps), round(item["end"] * fps)
+            lead = half if i > 0 else 0
+            tail = half if i < n - 1 else 0
+            frames = max(1, (e + tail) - (b - lead))
+            seg = os.path.join(work_dir, f"seg_{i:02d}.mp4")
+            scene = item["scene"]
+            asset: Optional[MediaAsset] = sb.asset(scene.asset_id)
+            used_media = False
+            if asset and asset.kind == "video" and os.path.exists(asset.path):
+                try:
+                    await self._video_segment(asset, scene.clip_start - lead / fps, frames, seg, punch=(i == 0))
+                    used_media = True
+                except RuntimeError as ex:
+                    self.last_warnings.append(f"씬 {i + 1} 영상 처리 실패 → 배경 대체")
+                    logging.getLogger(__name__).warning(f"{ex}")
+            elif asset and asset.kind == "image" and os.path.exists(asset.path):
+                still = os.path.join(work_dir, f"still_{i:02d}.png")
+                with Image.open(asset.path) as im:
+                    await asyncio.to_thread(lambda: self._vertical_frame(ImageOps.exif_transpose(im)).save(still))
+                await self._still_segment(still, frames, seg, "punch" if i == 0 else self.MOTIONS[i % len(self.MOTIONS)])
+                used_media = True
+            if not used_media:
+                await self._still_segment(bg_path, frames, seg, "punch" if i == 0 else "zoom_in")
+            segments.append((seg, frames))
+            flags.append(used_media)
+
+        track = os.path.join(work_dir, "video_track.mp4")
+        if n == 1:
+            os.replace(segments[0][0], track)
+            return track, flags
+
+        # xfade 체인: 각 전환은 다음 씬 세그먼트가 시작되는 시점(= 씬 경계 - 전환길이/2)에 시작
+        inputs, chains = [], []
+        for i, (seg, _) in enumerate(segments):
+            inputs += ["-i", seg]
+            chains.append(f"[{i}:v]fps={fps},settb=AVTB,format=yuv420p[s{i}]")
+        prev, out_frames = "s0", segments[0][1]
+        dur = 2 * half / fps
+        for i in range(1, n):
+            offset = (out_frames - 2 * half) / fps
+            label = f"x{i}"
+            trans = self.TRANSITIONS[(i - 1) % len(self.TRANSITIONS)]
+            chains.append(f"[{prev}][s{i}]xfade=transition={trans}:duration={dur:.4f}:offset={offset:.4f}[{label}]")
+            out_frames += segments[i][1] - 2 * half
+            prev = label
+        cmd = ["ffmpeg", "-y", "-v", "error", *inputs, "-filter_complex", ";".join(chains), "-map", f"[{prev}]",
+               "-frames:v", str(out_frames), "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-r", str(fps), track]
+        try:
+            await self._run(cmd, "장면 전환 합성 실패")
+        except RuntimeError as ex:
+            # 전환 합성이 실패해도 영상은 만들어지도록 겹침 없이 단순 연결 (전환만 생략)
+            logging.getLogger(__name__).warning(f"{ex} → 전환 없이 연결")
+            self.last_warnings.append("장면 전환 효과 생략")
+            trimmed = []
+            for i, (seg, frames) in enumerate(segments):
+                lead = half if i > 0 else 0
+                keep = frames - lead - (half if i < n - 1 else 0)
+                t_seg = os.path.join(work_dir, f"trim_{i:02d}.mp4")
+                await self._run(["ffmpeg", "-y", "-v", "error", "-i", seg, "-vf", f"trim=start_frame={lead}:end_frame={lead + keep},setpts=PTS-STARTPTS",
+                                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", t_seg], "세그먼트 정리 실패")
+                trimmed.append(t_seg)
+            concat = os.path.join(work_dir, "video.ffconcat")
+            with open(concat, "w", encoding="utf-8") as f:
+                f.write("ffconcat version 1.0\n" + "".join(f"file '{os.path.basename(x)}'\n" for x in trimmed))
+            await self._run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", concat, "-c", "copy", track], "영상 연결 실패")
+        return track, flags
+
+    async def _video_segment(self, asset: MediaAsset, clip_start: float, frames: int, out: str, punch: bool = False):
+        W, H, fps = self.WIDTH, self.HEIGHT, self.FPS
+        need = frames / fps
+        start = max(0.0, min(clip_start, max(0.0, asset.duration - 0.5)))
+        loop = start + need > asset.duration
+        if asset.width / max(1, asset.height) <= 0.75:
+            vf = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H}"
+        else:
+            # 가로 영상: 흐린 확대 배경 + 원본 전체 (블러 패딩)
+            vf = (f"split[a][b];[a]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},"
+                  f"boxblur=24:3,eq=brightness=-0.12[bg];[b]scale={W}:-2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2")
+        if punch:
+            # 오프닝: 처음 0.5초 동안 확대 상태에서 빠르게 제자리로 (펀치 줌)
+            pz = f"if(lt(t\\,0.5)\\,1.18-0.36*t\\,1)"
+            vf += f",scale=w='trunc(iw*{pz}/2)*2':h='trunc(ih*{pz}/2)*2':eval=frame,crop={W}:{H}"
+        cmd = ["ffmpeg", "-y", "-v", "error"]
+        if loop:
+            cmd += ["-stream_loop", "-1"]  # 클립이 씬보다 짧으면 반복
+        cmd += ["-ss", f"{start:.2f}", "-i", asset.path,
+                "-filter_complex", f"[0:v]{vf},fps={fps},setsar=1,format=yuv420p[v]", "-map", "[v]", "-an",
+                "-frames:v", str(frames), "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", out]
+        await self._run(cmd, f"{asset.id} 영상 세그먼트 생성 실패")
+
+    def _motion_expr(self, motion: str, frames: int) -> Tuple[str, str, str]:
+        """zoompan용 (zoom, x, y) 식. on = 출력 프레임 번호"""
+        N = max(1, frames - 1)
+        cx, cy = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
+        p = f"(on/{N})"
+        if motion == "punch":
+            P = min(15, N)  # 0.5초
+            z = f"if(lt(on\\,{P})\\,1.28-0.20*on/{P}\\,1.08+0.05*(on-{P})/{max(1, N - P)})"
+            return z, cx, cy
+        if motion == "zoom_out":
+            return f"1.14-0.12*{p}", cx, cy
+        if motion == "pan_right":
+            return "1.15", f"(iw-iw/zoom)*{p}", cy
+        if motion == "pan_left":
+            return "1.15", f"(iw-iw/zoom)*(1-{p})", cy
+        if motion == "pan_up":
+            return "1.15", cx, f"(ih-ih/zoom)*(1-{p})"
+        if motion == "diag":
+            return f"1.08+0.08*{p}", f"(iw-iw/zoom)*{p}", f"(ih-ih/zoom)*{p}"
+        return f"1.02+0.12*{p}", cx, cy  # zoom_in
+
+    async def _still_segment(self, image_path: str, frames: int, out: str, motion: str = "zoom_in"):
+        """정지 이미지 → 카메라 무브(줌인/줌아웃/팬/대각선/펀치) 세그먼트"""
+        W, H, fps = self.WIDTH, self.HEIGHT, self.FPS
+        z, x, y = self._motion_expr(motion, frames)
+        # 큰 해상도에서 움직여야 팬/줌의 정수 좌표 떨림이 줄어듦
+        vf = (f"scale={int(W * 1.5)}:{int(H * 1.5)},"
+              f"zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s={W}x{H}:fps={fps},"
+              "setsar=1,format=yuv420p")
+        cmd = ["ffmpeg", "-y", "-v", "error", "-i", image_path, "-vf", vf, "-frames:v", str(frames),
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", out]
+        await self._run(cmd, "이미지 모션 세그먼트 생성 실패")
+
+    # ------------------------------------------------------------------
+    # 4. 오버레이 (타이틀·씬 문구·자막·CTA)
+    # ------------------------------------------------------------------
+    def _static_layer(self, title: str) -> Image.Image:
+        """영상 위에 얹히는 고정 요소: 상·하단 가독성 그라데이션, 로고·타이틀, CTA 바"""
+        W, H = self.WIDTH, self.HEIGHT
+        layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        d = ImageDraw.Draw(layer)
+        for y in range(0, 560):
+            d.line([(0, y), (W, y)], fill=(0, 15, 45, int(200 * (1 - y / 560) ** 1.3)))
+        for y in range(1280, H):
+            d.line([(0, y), (W, y)], fill=(0, 10, 30, int(215 * ((y - 1280) / (H - 1280)) ** 0.9)))
+
+        f_logo = korean_font(30, "bold")
+        d.rounded_rectangle([80, 100, 290, 164], radius=14, fill="#00236F", outline="#3B82F6", width=2)
+        d.text((185, 132), "안마사랑", font=f_logo, fill="#FFFFFF", anchor="mm")
+        d.text((W - 80, 132), "국가공인 헬스키퍼", font=korean_font(26, "semibold"), fill="#E2E8F0", anchor="rm")
+        f_title = korean_font(46, "bold")
+        y = 200
+        for line in wrap_text_px(title, f_title, W - 160)[:2]:
+            d.text((80, y), line, font=f_title, fill="#FFFFFF", stroke_width=3, stroke_fill=(0, 20, 60, 200))
+            y += 58
+
+        d.rounded_rectangle([80, 1720, W - 80, 1840], radius=20, fill="#2563EB")
+        d.text((W // 2, 1780), f"상담전화 {HOTLINE}  |  anmasarang.com", font=korean_font(36, "bold"), fill="#FFFFFF", anchor="mm")
+        return layer
+
+    INTRO_SEC = 0.9      # 씬 문구 등장 애니메이션 길이
+    INTRO_STEP = 1 / 20  # 애니메이션 프레임 간격 (20fps로 그려도 충분히 부드러움)
+    NUMBER_RE = re.compile(r"(?<![\d\-.])(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?(?![\d\-])")
+
+    def _scene_base_layer(self, scene: ShortsScene, index: int, total: int, has_media: bool) -> Image.Image:
+        """씬마다 고정인 요소: 구간 라벨, 씬 번호, (에셋 없는 씬) 어두운 카드"""
+        W = self.WIDTH
+        layer = Image.new("RGBA", (W, self.HEIGHT), (0, 0, 0, 0))
+        d = ImageDraw.Draw(layer)
+        label = self.SECTION_LABELS.get(scene.section_type, "핵심 포인트")
+        f_label = korean_font(28, "bold")
+        lw = int(f_label.getlength(label)) + 48
+        if has_media:
+            d.rounded_rectangle([80, 340, 80 + lw, 394], radius=27, fill="#FFB800")
+            d.text((80 + lw / 2, 367), label, font=f_label, fill="#0F172A", anchor="mm")
+            d.text((W - 80, 367), f"{index + 1} / {total}", font=korean_font(28, "semibold"), fill="#E2E8F0", anchor="rm")
+        else:
+            d.rounded_rectangle((80, 450, W - 80, 1300), radius=32, fill=(15, 23, 42, 205), outline=(51, 65, 85, 255), width=2)
+            d.rounded_rectangle([130, 500, 130 + lw, 556], radius=28, fill="#FFB800")
+            d.text((130 + lw / 2, 528), label, font=f_label, fill="#0F172A", anchor="mm")
+            d.text((W - 130, 528), f"{index + 1} / {total}", font=korean_font(28, "semibold"), fill="#94A3B8", anchor="rm")
+        return layer
+
+    def _count_up(self, text: str, frac: float) -> str:
+        """문구 속 숫자를 0 → 원래 값으로 증가시키며 표시 (전화번호·소수점 자리수·천단위 쉼표 유지)"""
+        def repl(m):
+            int_part, dec_part = m.group(1), m.group(2) or ""
+            value = float(int_part.replace(",", "") + dec_part)
+            cur = value * frac
+            decimals = len(dec_part) - 1 if dec_part else 0
+            out = f"{cur:,.{decimals}f}" if "," in int_part else f"{cur:.{decimals}f}"
+            return out
+        return self.NUMBER_RE.sub(repl, text)
+
+    def _caption_layer(self, scene: ShortsScene, has_media: bool, title: str, progress: float) -> Optional[Image.Image]:
+        """씬 핵심 문구. progress<1 이면 팝업(확대+바운스) + 페이드인 + 아래→위 이동 + 숫자 카운트업"""
+        caption = scene.display_caption or ""
+        if not caption or (has_media and re.sub(r"\W", "", caption) == re.sub(r"\W", "", title)):
+            return None  # 오프닝 문구가 상단 타이틀과 같으면 중복 표시 생략
+        W = self.WIDTH
+        ease = 1 - (1 - min(1.0, progress)) ** 3
+        text = caption if progress >= 1 else self._count_up(caption, ease)
+        layer = Image.new("RGBA", (W, self.HEIGHT), (0, 0, 0, 0))
+        d = ImageDraw.Draw(layer)
+        if has_media:
+            font = korean_font(58, "bold")
+            y = 420
+            lines = wrap_text_px(text, font, W - 160)[:2]
+            for line in lines:
+                d.text((80, y), line, font=font, fill="#FFFFFF", stroke_width=5, stroke_fill="#000000")
+                y += 72
+        else:
+            box = (80, 450, W - 80, 1300)
+            size = 76
+            while True:
+                font = korean_font(size, "bold")
+                final_lines = wrap_text_px(caption, font, box[2] - box[0] - 120)
+                if len(final_lines) <= 4 or size <= 48:
+                    break
+                size -= 4
+            lines = wrap_text_px(text, font, box[2] - box[0] - 120)[:4]
+            lh = int(text_height(font) * 1.25)
+            y = (box[1] + 110 + box[3]) // 2 - (lh * len(final_lines[:4])) // 2
+            for line in lines:
+                d.text((W // 2, y), line, font=font, fill="#FFFFFF", anchor="ma")
+                y += lh
+        if progress >= 1:
+            return layer
+
+        # 팝업 애니메이션: 0.7배 → 1.06배(오버슈트) → 1배, 투명 → 불투명, 40px 아래 → 제자리
+        p = min(1.0, progress / 0.55)
+        c1, c3 = 1.70158, 2.70158
+        back = 1 + c3 * (p - 1) ** 3 + c1 * (p - 1) ** 2  # easeOutBack
+        scale = 0.7 + 0.3 * back
+        alpha = min(1.0, progress / 0.25)
+        dy = int(40 * (1 - min(1.0, p)))
+        bbox = layer.getbbox()
+        if not bbox:
+            return layer
+        piece = layer.crop(bbox)
+        nw, nh = max(1, int(piece.width * scale)), max(1, int(piece.height * scale))
+        piece = piece.resize((nw, nh), Image.LANCZOS)
+        if alpha < 1:
+            piece.putalpha(piece.getchannel("A").point(lambda a: int(a * alpha)))
+        out = Image.new("RGBA", layer.size, (0, 0, 0, 0))
+        cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+        out.paste(piece, (int(cx - nw / 2), int(cy - nh / 2 + dy)), piece)
+        return out
+
+    def _subtitle_layer(self, words: List[str], active: int) -> Image.Image:
+        """노래방식 자막: 현재 발화 단어는 노란색 + 약간 크게, 나머지는 흰색 (검은 외곽선)"""
+        W = self.WIDTH
+        layer = Image.new("RGBA", (W, self.HEIGHT), (0, 0, 0, 0))
+        d = ImageDraw.Draw(layer)
+        font = korean_font(72, "bold")
+        font_active = korean_font(82, "bold")
+        space = font.getlength(" ")
+        width_of = lambda i: (font_active if i == active else font).getlength(words[i])
+        lines: List[List[int]] = [[]]
+        width = 0.0
+        for i in range(len(words)):
+            ww = width_of(i)
+            if lines[-1] and width + space + ww > 900:
+                lines.append([])
+                width = 0.0
+            width += (space if lines[-1] else 0) + ww
+            lines[-1].append(i)
+        lh = int(text_height(font) * 1.2)
+        ascent = font.getmetrics()[0]
+        y = 1560 - (lh * len(lines)) // 2
+        for line in lines:
+            line_w = sum(width_of(i) for i in line) + space * (len(line) - 1)
+            x = (W - line_w) / 2
+            for i in line:
+                is_active = i == active
+                d.text((x, y + ascent), words[i], font=font_active if is_active else font, anchor="ls",
+                       fill="#FFD400" if is_active else "#FFFFFF", stroke_width=6, stroke_fill="#000000")
+                x += width_of(i) + space
+            y += lh
+        return layer
+
+    def _render_overlay_sequence(self, title: str, timeline: List[Dict[str, Any]], events: List[Dict[str, Any]],
+                                 total: float, work_dir: str, media_flags: List[bool]) -> str:
+        """시점별 오버레이 PNG + FFmpeg concat 목록(지속시간 포함) 작성.
+
+        자막 단어가 바뀌는 시점과 씬 문구 등장 애니메이션 프레임 시점을 합쳐 구간을 나누고,
+        각 구간에 맞는 화면(고정 요소 + 씬 라벨 + 문구 애니메이션 + 자막)을 한 장씩 그린다.
+        """
+        static = self._static_layer(title)
+        starts = [item["start"] for item in timeline]
+        base_cache: Dict[int, Image.Image] = {}
+        caption_final: Dict[int, Optional[Image.Image]] = {}
+        sub_cache: Dict[int, Image.Image] = {}
+
+        times = {0.0}
+        steps = int(round(self.INTRO_SEC / self.INTRO_STEP))
+        for s0 in starts:
+            for k in range(steps + 1):
+                times.add(round(s0 + k * self.INTRO_STEP, 3))
+        for ev in events:
+            times.add(round(ev["start"], 3))
+        points = sorted(t for t in times if t < total - 0.01)
+
+        def scene_at(t: float) -> int:
+            idx = 0
+            for i, s0 in enumerate(starts):
+                if s0 <= t + 1e-6:
+                    idx = i
+            return idx
+
+        ev_i = 0
+        entries: List[Tuple[str, float]] = []
+        for n, t in enumerate(points):
+            nxt = points[n + 1] if n + 1 < len(points) else total
+            dur = nxt - t
+            if dur <= 0.001:
+                continue
+            si = scene_at(t)
+            while ev_i + 1 < len(events) and events[ev_i + 1]["start"] <= t + 1e-6:
+                ev_i += 1
+            ev = events[ev_i] if events and events[ev_i]["start"] <= t + 1e-6 < events[ev_i]["end"] + 1e-6 else None
+
+            if si not in base_cache:
+                base_cache[si] = Image.alpha_composite(
+                    static, self._scene_base_layer(timeline[si]["scene"], si, len(timeline), media_flags[si]))
+            frame = base_cache[si]
+            progress = (t - starts[si]) / self.INTRO_SEC
+            if progress >= 1:
+                if si not in caption_final:
+                    caption_final[si] = self._caption_layer(timeline[si]["scene"], media_flags[si], title, 1.0)
+                cap = caption_final[si]
+            else:
+                cap = self._caption_layer(timeline[si]["scene"], media_flags[si], title, progress)
+            if cap is not None:
+                frame = Image.alpha_composite(frame, cap)
+            if ev is not None:
+                if ev_i not in sub_cache:
+                    sub_cache[ev_i] = self._subtitle_layer(ev["words"], ev["active"])
+                frame = Image.alpha_composite(frame, sub_cache[ev_i])
+            path = os.path.join(work_dir, f"ov_{n:05d}.png")
+            frame.save(path, "PNG", compress_level=1)
+            entries.append((path, dur))
+
+        concat_path = os.path.join(work_dir, "overlay.ffconcat")
+        with open(concat_path, "w", encoding="utf-8") as f:
+            f.write("ffconcat version 1.0\n")
+            for path, dur in entries:
+                f.write(f"file '{os.path.basename(path)}'\nduration {dur:.3f}\n")
+            f.write(f"file '{os.path.basename(entries[-1][0])}'\n")  # concat 데뮤서 규칙: 마지막 파일 반복
+        return concat_path
+
+    # ------------------------------------------------------------------
+    # 5. 최종 인코딩
+    # ------------------------------------------------------------------
+    async def _run(self, cmd: List[str], error_message: str) -> None:
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            tail = stderr.decode(errors="ignore").strip().splitlines()[-3:]
+            raise RuntimeError(f"{error_message}: {' | '.join(tail)}")
+
+    async def _run_ffmpeg_encode(self, video_track: str, overlay_concat: str, audio_path: str, output_mp4: str, duration: float):
+        dur = f"{duration:.3f}"
+        filter_complex = (
+            f"[1:v]fps={self.FPS},format=rgba[ov];"
+            f"[0:v][ov]overlay=0:0:eof_action=repeat[base];"
+            # 상단 진행바: 반투명 트랙 위로 노란 막대가 영상 길이에 맞춰 채워짐
+            f"[base]drawbox=x=0:y=0:w=iw:h=10:color=black@0.35:t=fill[bt];"
+            f"[3:v]format=rgba[bar];"
+            f"[bt][bar]overlay=x='-w+w*t/{dur}':y=0:eof_action=pass,format=yuv420p[v]"
+        )
+        tmp_out = output_mp4 + ".part.mp4"
+        cmd = [
+            "ffmpeg", "-y", "-v", "error",
+            "-i", video_track,
+            "-f", "concat", "-safe", "0", "-i", overlay_concat,
+            "-i", audio_path,
+            "-f", "lavfi", "-i", f"color=c=0xFFD400:s={self.WIDTH}x10:r={self.FPS}:d={dur}",
+            "-filter_complex", filter_complex,
+            "-map", "[v]", "-map", "2:a",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-r", str(self.FPS),
+            "-c:a", "aac", "-b:a", "192k",
+            "-t", dur,
+            "-movflags", "+faststart",
+            tmp_out,
+        ]
+        await self._run(cmd, "FFmpeg 인코딩 실패")
+        if await self._get_audio_duration(tmp_out) <= 0:
+            raise RuntimeError("FFmpeg 출력 파일이 비어 있습니다.")
+        os.replace(tmp_out, output_mp4)
