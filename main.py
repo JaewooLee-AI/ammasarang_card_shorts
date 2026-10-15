@@ -292,7 +292,8 @@ async def main(page: ft.Page):
     page.on_resize = lambda e: apply_layout(e.width)
     apply_layout(page.width)
 
-    center_panel.set_loading(False, "왼쪽에 프롬프트를 입력하고 이미지·동영상을 첨부한 뒤 [AI 디렉터 생성]을 누르세요. (예시 불러오기도 가능)")
+    center_panel.set_loading(False, "왼쪽에 프롬프트를 입력하고 이미지·동영상을 첨부한 뒤 [AI 디렉터 생성]을 누르세요."
+                             + (" (예시 불러오기도 가능)" if scenarios else ""))
 
 def create_web_app():
     """웹 모드 ASGI 앱 (+ 결과물 다운로드 라우트)"""
