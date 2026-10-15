@@ -50,6 +50,7 @@ class LLMShortsScene(BaseModel):
     duration_seconds: float
     asset_id: str = Field(default="", description="이 씬 화면에 쓸 첨부 에셋 ID. 없으면 빈 문자열")
     clip_start: float = Field(default=0.0, description="동영상 에셋이면 사용 시작 시각(초)")
+    emphasis_words: List[str] = Field(default_factory=list, description="display_caption 안에서 크게 강조할 핵심 단어 1~2개 (문구에 있는 그대로)")
 
 
 class LLMAssetNote(BaseModel):
@@ -222,9 +223,30 @@ class AIDirectorService:
         auto_assign = storyboard is None
         if not storyboard:
             storyboard = self._generate_rule_based_storyboard(payload, source)
+        self._ensure_emphasis(storyboard)
 
         self._bind_assets(storyboard, payload, auto_assign, notes)
         return self._apply_guardrails(storyboard, payload, source, notes)
+
+    # 강조어 후보: 도메인 핵심 단어 (키네틱 타이포에서 크게 표시)
+    EMPHASIS_KEYWORDS = ["합법", "감면", "절감", "절세", "국가공인", "만족도", "바우처", "의료법", "위반", "형사처벌",
+                         "헬스키퍼", "연계고용", "무료", "선수금", "전원일치", "합헌", "상생", "일자리", "통증", "안마사랑"]
+
+    EMPHASIS_NUMBER = re.compile(r"\d{4}-\d{4}|\d[\d,]*(?:\.\d+)?\s*(?:억|만|천)?\s*(?:원권|원|점|%|시간|분|명|개월|년|곳|배|자리)?")
+
+    def _ensure_emphasis(self, sb: EditableStoryboard):
+        """씬별 강조어 검증·보완: 문구에 실제로 있는 단어만 남기고, 없으면 숫자 → 도메인 키워드 → 가장 긴 단어 순으로 선택"""
+        for scene in sb.shorts_scenes:
+            caption = scene.display_caption or ""
+            words = [w for w in (scene.emphasis_words or []) if w and w.strip() and w.strip() in caption]
+            if not words:
+                words = [m.group(0).strip() for m in self.EMPHASIS_NUMBER.finditer(caption)][:2]
+            if not words:
+                words = [k for k in self.EMPHASIS_KEYWORDS if k in caption][:1]
+            if not words and caption.strip():
+                tokens = [t.strip(".,!?·…") for t in caption.split()]
+                words = [max(tokens, key=len)] if tokens else []
+            scene.emphasis_words = words[:2]
 
     # ------------------------------------------------------------------
     # 에셋 배치 (LLM 결과 검증 / 규칙 기반 자동 배치)
@@ -514,6 +536,7 @@ class AIDirectorService:
 - 카드뉴스 {payload.card_count}장: 1장 cover, 중간은 body(수치 비교가 있으면 1장은 comparison_table + comparison_rows 작성), 마지막 장 call_to_action
 - 각 lead_headline은 40자 이내, body_content는 줄바꿈으로 구분된 3~4줄, takeaway는 30자 이내
 - 쇼츠 4~6씬, 전체 내레이션 {payload.shorts_seconds}초 내외(한국어 초당 약 6~7자): 첫 씬 hook, 중간 body, 마지막 씬 conclusion. display_caption은 30자 이내
+- 각 씬의 emphasis_words에는 display_caption 속 핵심 단어 1~2개(숫자·금액·핵심 명사)를 문구에 적힌 그대로 넣을 것
 {asset_rule}
 - image_prompt/visual_motion_prompt는 이미지 안에 글자가 들어가지 않는 장면 묘사로 작성
 - 마지막 장/씬에는 고객센터 {HOTLINE} 과 {WEBSITE} 를 포함

@@ -52,6 +52,7 @@ class ShortsScene(BaseModel):
     word_timestamps: List[WordTimestamp] = Field(default_factory=list, description="단어별 정밀 시작/종료 타임스탬프")
     asset_id: Optional[str] = Field(default=None, description="이 씬의 화면에 쓸 에셋 ID")
     clip_start: float = Field(default=0.0, description="동영상 에셋을 쓸 경우 사용 시작 시각(초)")
+    emphasis_words: List[str] = Field(default_factory=list, description="키네틱 타이포에서 크게 강조할 display_caption 속 단어 (1~2개)")
 
 class UserRequestPayload(BaseModel):
     """사용자 입력 요청 페이로드"""

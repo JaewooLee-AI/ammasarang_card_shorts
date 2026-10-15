@@ -7,7 +7,7 @@ from typing import List, Optional, Tuple
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from models.schema import CardSlide, EditableStoryboard, MediaAsset
-from services.fonts import korean_font, wrap_text_px, text_height
+from services.fonts import korean_font, display_font, wrap_text_px, text_height
 
 HOTLINE = "1577-1398"
 
@@ -45,8 +45,8 @@ class CardNewsRendererService:
 
     def __init__(self, export_dir: str = None):
         if not export_dir:
-            base_dir = os.path.dirname(os.path.dirname(__file__))
-            self.export_dir = os.path.join(base_dir, "exports", "cards")
+            from services.paths import EXPORTS_DIR
+            self.export_dir = os.path.join(EXPORTS_DIR, "cards")
         else:
             self.export_dir = export_dir
         os.makedirs(self.export_dir, exist_ok=True)
@@ -130,7 +130,7 @@ class CardNewsRendererService:
                 sd.line([(0, y), (W, y)], fill=(0, 20, 60, a))
             img = Image.alpha_composite(img, shade).convert("RGB")
             draw = ImageDraw.Draw(img)
-            self._pill(draw, (M, 60), "안마사랑", korean_font(26, "bold"), "#00236F", "#FFFFFF", pad_x=22, height=52, radius=10)
+            self._pill(draw, (M, 60), "안마사랑", display_font(26, "안마사랑"), "#00236F", "#FFFFFF", pad_x=22, height=52, radius=10)
             draw.text((M + 180, 85), "국가공인 헬스키퍼 연계고용", font=f_small, fill="#E2E8F0", anchor="lm")
             self._pill(draw, (W - M - bw, 60), badge, f_small, "#FFFFFF", "#00236F", pad_x=22, height=50, radius=25)
 
@@ -141,7 +141,7 @@ class CardNewsRendererService:
             blh = int(text_height(f_body) * 1.35)
             block_h = 66 + lh * len(lead_lines) + 24 + blh * len(body_lines)
             y = 1060 - block_h
-            self._pill(draw, (M, y), tag_text, korean_font(21, "semibold"), "#FFB800", "#0F172A", pad_x=24, height=48, radius=24)
+            self._pill(draw, (M, y), tag_text, display_font(21, tag_text), "#FFB800", "#0F172A", pad_x=24, height=48, radius=24)
             y += 66
             for line in lead_lines:
                 draw.text((M, y), line, font=f_lead, fill="#FFFFFF")
@@ -155,7 +155,7 @@ class CardNewsRendererService:
             img = Image.new("RGB", (W, H), "#F8FAFC")
             draw = ImageDraw.Draw(img)
             draw.rectangle([0, 0, W, 20], fill="#00236F")
-            self._pill(draw, (M, 60), "안마사랑", korean_font(26, "bold"), "#00236F", "#FFFFFF", pad_x=22, height=52, radius=10)
+            self._pill(draw, (M, 60), "안마사랑", display_font(26, "안마사랑"), "#00236F", "#FFFFFF", pad_x=22, height=52, radius=10)
             draw.text((M + 180, 85), "국가공인 헬스키퍼 연계고용", font=f_small, fill="#475569", anchor="lm")
             self._pill(draw, (W - M - bw, 60), badge, f_small, "#EFF6FF", "#2563EB", pad_x=22, height=50, radius=25, outline="#BFDBFE")
 
@@ -167,7 +167,7 @@ class CardNewsRendererService:
             img.paste(pic, (px0, py0), mask)
 
             tag_text = self.TYPE_NAMES.get(slide.slide_type, "비즈니스 솔루션")
-            self._pill(draw, (M, 670), tag_text, korean_font(21, "semibold"), "#DBEAFE", "#1E3A8A", pad_x=24, height=46, radius=23)
+            self._pill(draw, (M, 670), tag_text, display_font(21, tag_text), "#DBEAFE", "#1E3A8A", pad_x=24, height=46, radius=23)
             f_lead, lead_lines = self._fit_lines(slide.lead_headline, W - 2 * M, start=44, minimum=32, max_lines=2, weight="bold")
             y = 740
             lh = int(text_height(f_lead) * 1.18)
@@ -195,7 +195,7 @@ class CardNewsRendererService:
         draw.line([M, 1225, W - M, 1225], fill="#E2E8F0" if not dark else "#94A3B8", width=2)
         draw.text((M, 1270), "anmasarang.com | 대한민국 1등 헬스케어 바우처", font=korean_font(22, "medium"),
                   fill="#64748B" if not dark else "#E2E8F0", anchor="lm")
-        draw.text((W - M, 1270), f"상담문의 {HOTLINE}", font=korean_font(24, "bold"),
+        draw.text((W - M, 1270), f"상담문의 {HOTLINE}", font=display_font(24, f"상담문의 {HOTLINE}"),
                   fill="#2563EB" if not dark else "#FFD400", anchor="rm")
 
     # ------------------------------------------------------------------
@@ -208,7 +208,7 @@ class CardNewsRendererService:
         draw.rectangle([0, 0, W, 20], fill="#00236F")
 
         # 1. 헤더: 로고 + 슬로건 + 페이지 뱃지
-        f_logo = korean_font(26, "bold")
+        f_logo = display_font(26, "안마사랑")
         f_small = korean_font(21, "semibold")
         self._pill(draw, (M, 60), "안마사랑", f_logo, "#00236F", "#FFFFFF", pad_x=22, height=52, radius=10)
         draw.text((M + 180, 85), "국가공인 헬스키퍼 연계고용", font=f_small, fill="#475569", anchor="lm")
@@ -219,7 +219,7 @@ class CardNewsRendererService:
 
         # 2. 슬라이드 유형 태그
         tag_text = self.TYPE_NAMES.get(slide.slide_type, "비즈니스 솔루션")
-        self._pill(draw, (M, 170), tag_text, korean_font(21, "semibold"), "#DBEAFE", "#1E3A8A", pad_x=24, height=50, radius=25)
+        self._pill(draw, (M, 170), tag_text, display_font(21, tag_text), "#DBEAFE", "#1E3A8A", pad_x=24, height=50, radius=25)
 
         # 3. Lead 헤드라인 (최대 3줄, 넘치면 글자 크기 축소)
         content_w = W - 2 * M
@@ -259,7 +259,7 @@ class CardNewsRendererService:
         f_footer = korean_font(22, "medium")
         draw.line([M, 1225, W - M, 1225], fill="#E2E8F0", width=2)
         draw.text((M, 1270), "anmasarang.com | 대한민국 1등 헬스케어 바우처", font=f_footer, fill="#64748B", anchor="lm")
-        draw.text((W - M, 1270), f"상담문의 {HOTLINE}", font=korean_font(24, "bold"), fill="#2563EB", anchor="rm")
+        draw.text((W - M, 1270), f"상담문의 {HOTLINE}", font=display_font(24, f"상담문의 {HOTLINE}"), fill="#2563EB", anchor="rm")
 
         img.save(output_path, "PNG")
 
@@ -274,7 +274,8 @@ class CardNewsRendererService:
         """지정 줄 수 안에 들어갈 때까지 폰트 크기를 줄여가며 줄바꿈"""
         size = start
         while True:
-            font = korean_font(size, weight)
+            # 굵은 문구(헤드라인·요약 바)는 디스플레이 폰트, 그 외는 본문 폰트
+            font = display_font(size, text) if weight == "bold" else korean_font(size, weight)
             lines = wrap_text_px(text, font, max_width)
             if len(lines) <= max_lines or size <= minimum:
                 if len(lines) > max_lines:

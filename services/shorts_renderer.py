@@ -4,14 +4,26 @@ import re
 import shutil
 import asyncio
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from PIL import Image, ImageDraw, ImageFilter, ImageOps
 from models.schema import ShortsScene, EditableStoryboard, MediaAsset
-from services.fonts import korean_font, wrap_text_px, text_height
+from services.fonts import korean_font, display_font, wrap_text_px, text_height
 
 HOTLINE = "1577-1398"
 SCENE_GAP = 0.3  # 씬 사이 호흡(초)
+
+
+@dataclass
+class ShortsOptions:
+    """렌더링 시점 옵션 (스토리보드를 다시 만들지 않고 바꿀 수 있는 항목)"""
+    caption_style: str = "basic"        # basic(기본 팝업) | kinetic(키네틱 타이포)
+    voice: str = "auto"                 # auto | Gemini 목소리 이름 | system(macOS Yuna·gTTS)
+    gemini_api_key: Optional[str] = None
+    veo_scope: str = "none"             # none | opening | key2 | all  (Veo AI 영상화 범위)
+    veo_quality: str = "fast"           # lite | fast | standard
+    video_overrides: Optional[Dict[int, MediaAsset]] = None  # {장면 인덱스: Veo 동영상} — 해당 장면 배경만 교체
 
 
 class ShortsRendererService:
@@ -30,18 +42,21 @@ class ShortsRendererService:
 
     def __init__(self, export_dir: str = None):
         if not export_dir:
-            base_dir = os.path.dirname(os.path.dirname(__file__))
-            self.export_dir = os.path.join(base_dir, "exports", "shorts")
+            from services.paths import EXPORTS_DIR
+            self.export_dir = os.path.join(EXPORTS_DIR, "shorts")
         else:
             self.export_dir = export_dir
         os.makedirs(self.export_dir, exist_ok=True)
         self.last_warnings: List[str] = []
+        self.last_tts_engine: str = ""
         self._has_yuna: Optional[bool] = None
+        self.options = ShortsOptions()
 
     # ------------------------------------------------------------------
     # 진입점
     # ------------------------------------------------------------------
-    async def render_shorts_video(self, storyboard: EditableStoryboard, progress_callback=None) -> str:
+    async def render_shorts_video(self, storyboard: EditableStoryboard, progress_callback=None,
+                                  options: Optional[ShortsOptions] = None) -> str:
         scenes = [s for s in storyboard.shorts_scenes if (s.narration_script or "").strip()]
         if not scenes:
             raise ValueError("내레이션이 있는 쇼츠 씬이 없습니다.")
@@ -49,6 +64,7 @@ class ShortsRendererService:
             raise RuntimeError("ffmpeg/ffprobe가 설치되어 있지 않습니다. (macOS: brew install ffmpeg)")
 
         self.last_warnings = []
+        self.options = options or ShortsOptions()
         output_mp4 = os.path.join(self.export_dir, "final_shorts.mp4")
         audio_path = os.path.join(self.export_dir, "combined_narration.mp3")
         ass_path = os.path.join(self.export_dir, "captions.ass")
@@ -63,7 +79,8 @@ class ShortsRendererService:
 
         try:
             await progress(0.1, "씬별 한국어 내레이션 음성 합성 중...")
-            scene_timeline, total_duration = await self._synthesize_scenes(scenes, work_dir, audio_path)
+            scene_timeline, total_duration = await self._synthesize_scenes(
+                scenes, work_dir, audio_path, storyboard.tone_and_manner or "")
 
             await progress(0.4, "단어별 하이라이트 자막 타임라인 계산 중...")
             events = self._build_caption_events(scene_timeline, total_duration)
@@ -118,26 +135,47 @@ class ShortsRendererService:
                         "-t", f"{est_duration:.2f}", wav], check=True)
         return wav, "silent"
 
-    async def _synthesize_scenes(self, scenes: List[ShortsScene], work_dir: str, audio_path: str):
-        timeline: List[Dict[str, Any]] = []
-        engines = set()
-        files = []
-        for i, scene in enumerate(scenes):
-            text = scene.narration_script.strip()
-            path, engine = await asyncio.to_thread(
-                self._tts_scene, text, os.path.join(work_dir, f"scene_{i:02d}"), max(1.0, scene.duration_seconds)
-            )
-            engines.add(engine)
-            dur = await self._get_audio_duration(path)
-            if dur <= 0:
-                dur = max(1.0, scene.duration_seconds)
-            files.append(path)
-            timeline.append({"scene": scene, "speech": dur})
+    async def _gemini_tts(self, scenes: List[ShortsScene], work_dir: str, tone: str) -> Optional[List[str]]:
+        """Gemini TTS로 전체 씬 합성. 실패하면 None (호출 측이 전체를 시스템 음성으로 대체해 목소리가 섞이지 않게 함)"""
+        from services.tts_gemini import GeminiTTS, pick_voice
+        opts = self.options
+        api_key = opts.gemini_api_key or os.environ.get("GEMINI_API_KEY")
+        if opts.voice == "system":
+            return None
+        if not api_key:
+            self.last_warnings.append("Gemini 키 없음 → macOS 기본 음성 사용")
+            return None
+        voice = pick_voice(opts.voice, tone)
+        tts = GeminiTTS(api_key, voice, tone, os.path.join(self.export_dir, "tts_cache"))
+        outs = [os.path.join(work_dir, f"scene_{i:02d}.wav") for i in range(len(scenes))]
+        try:
+            reused = await tts.synthesize_all([s.narration_script.strip() for s in scenes], outs)
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Gemini TTS 실패: {e}")
+            self.last_warnings.append(f"Gemini 음성 합성 실패 → macOS 기본 음성으로 대체 ({type(e).__name__})")
+            return None
+        self.last_tts_engine = f"Gemini TTS · {voice} ({tts.model_used})" + (f" · 캐시 {reused}개 재사용" if reused else "")
+        return outs
 
-        if "silent" in engines:
-            self.last_warnings.append("음성 합성 실패 구간은 무음 처리됨")
-        elif "gtts" in engines:
-            self.last_warnings.append("macOS Yuna 음성 없음 → gTTS 사용")
+    async def _synthesize_scenes(self, scenes: List[ShortsScene], work_dir: str, audio_path: str, tone: str = ""):
+        timeline: List[Dict[str, Any]] = []
+        files = await self._gemini_tts(scenes, work_dir, tone)
+        if files is None:
+            engines, files = set(), []
+            for i, scene in enumerate(scenes):
+                path, engine = await asyncio.to_thread(
+                    self._tts_scene, scene.narration_script.strip(), os.path.join(work_dir, f"scene_{i:02d}"),
+                    max(1.0, scene.duration_seconds))
+                engines.add(engine)
+                files.append(path)
+            self.last_tts_engine = "macOS Yuna" if engines == {"yuna"} else ", ".join(sorted(engines))
+            if "silent" in engines:
+                self.last_warnings.append("음성 합성 실패 구간은 무음 처리됨")
+            elif "gtts" in engines:
+                self.last_warnings.append("macOS Yuna 음성 없음 → gTTS 사용")
+        for scene, path in zip(scenes, files):
+            dur = await self._get_audio_duration(path)
+            timeline.append({"scene": scene, "speech": dur if dur > 0 else max(1.0, scene.duration_seconds)})
 
         # 씬 오디오 이어붙이기 (씬 사이 SCENE_GAP초 여백)
         inputs, filters = [], []
@@ -310,10 +348,14 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             seg = os.path.join(work_dir, f"seg_{i:02d}.mp4")
             scene = item["scene"]
             asset: Optional[MediaAsset] = sb.asset(scene.asset_id)
+            clip_start = scene.clip_start
+            override = (self.options.video_overrides or {}).get(sb.shorts_scenes.index(scene))
+            if override is not None and os.path.exists(override.path):
+                asset, clip_start = override, 0.0  # Veo AI 영상으로 이 장면 배경만 교체
             used_media = False
             if asset and asset.kind == "video" and os.path.exists(asset.path):
                 try:
-                    await self._video_segment(asset, scene.clip_start - lead / fps, frames, seg, punch=(i == 0))
+                    await self._video_segment(asset, clip_start - lead / fps, frames, seg, punch=(i == 0))
                     used_media = True
                 except RuntimeError as ex:
                     self.last_warnings.append(f"씬 {i + 1} 영상 처리 실패 → 배경 대체")
@@ -439,18 +481,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         for y in range(1280, H):
             d.line([(0, y), (W, y)], fill=(0, 10, 30, int(215 * ((y - 1280) / (H - 1280)) ** 0.9)))
 
-        f_logo = korean_font(30, "bold")
+        f_logo = display_font(30, "안마사랑")
         d.rounded_rectangle([80, 100, 290, 164], radius=14, fill="#00236F", outline="#3B82F6", width=2)
         d.text((185, 132), "안마사랑", font=f_logo, fill="#FFFFFF", anchor="mm")
         d.text((W - 80, 132), "국가공인 헬스키퍼", font=korean_font(26, "semibold"), fill="#E2E8F0", anchor="rm")
-        f_title = korean_font(46, "bold")
+        f_title = display_font(46, title)
         y = 200
         for line in wrap_text_px(title, f_title, W - 160)[:2]:
             d.text((80, y), line, font=f_title, fill="#FFFFFF", stroke_width=3, stroke_fill=(0, 20, 60, 200))
             y += 58
 
         d.rounded_rectangle([80, 1720, W - 80, 1840], radius=20, fill="#2563EB")
-        d.text((W // 2, 1780), f"상담전화 {HOTLINE}  |  anmasarang.com", font=korean_font(36, "bold"), fill="#FFFFFF", anchor="mm")
+        d.text((W // 2, 1780), f"상담전화 {HOTLINE}  |  anmasarang.com", font=display_font(36, f"상담전화 {HOTLINE}  |  anmasarang.com"), fill="#FFFFFF", anchor="mm")
         return layer
 
     INTRO_SEC = 0.9      # 씬 문구 등장 애니메이션 길이
@@ -463,7 +505,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         layer = Image.new("RGBA", (W, self.HEIGHT), (0, 0, 0, 0))
         d = ImageDraw.Draw(layer)
         label = self.SECTION_LABELS.get(scene.section_type, "핵심 포인트")
-        f_label = korean_font(28, "bold")
+        f_label = display_font(28, label)
         lw = int(f_label.getlength(label)) + 48
         if has_media:
             d.rounded_rectangle([80, 340, 80 + lw, 394], radius=27, fill="#FFB800")
@@ -487,6 +529,190 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             return out
         return self.NUMBER_RE.sub(repl, text)
 
+    # ------------------------------------------------------------------
+    # 문구 스타일 분기: basic(팝업) / kinetic(키네틱 타이포)
+    # ------------------------------------------------------------------
+    def _anim_len(self, scene: ShortsScene, has_media: bool, title: str) -> float:
+        if self.options.caption_style != "kinetic":
+            return self.INTRO_SEC
+        if self._big_numbers(scene):
+            return 1.6
+        n = len((scene.display_caption or "").split())
+        return min(2.6, 0.08 + 0.09 * max(0, n - 1) + 0.3 + 0.5)
+
+    def _scene_caption(self, scene: ShortsScene, has_media: bool, title: str, t_rel: float) -> Optional[Image.Image]:
+        if self.options.caption_style == "kinetic":
+            return self._kinetic_layer(scene, has_media, title, t_rel)
+        return self._caption_layer(scene, has_media, title, t_rel / self.INTRO_SEC)
+
+    @staticmethod
+    def _ease_out(p: float) -> float:
+        p = max(0.0, min(1.0, p))
+        return 1 - (1 - p) ** 3
+
+    def _big_numbers(self, scene: ShortsScene) -> List[str]:
+        """'대형 숫자 장면' 대상: 강조어 중 숫자(전화번호 제외). 마무리 씬은 제외"""
+        if scene.section_type == "conclusion":
+            return []
+        return [w for w in (scene.emphasis_words or [])
+                if re.search(r"\d", w) and not re.fullmatch(r"\d{4}-\d{4}", w.strip())][:2]
+
+    def _word_image(self, text: str, size: int, color: str) -> Image.Image:
+        key = (text, size, color)
+        cache = self.__dict__.setdefault("_word_cache", {})
+        if key not in cache:
+            font = display_font(size, text)
+            stroke = max(3, size // 14)
+            l, t, r, b = font.getbbox(text, stroke_width=stroke)
+            img = Image.new("RGBA", (r - l + 4, b - t + 4), (0, 0, 0, 0))
+            ImageDraw.Draw(img).text((2 - l, 2 - t), text, font=font, fill=color, stroke_width=stroke, stroke_fill="#000000")
+            cache[key] = (img, t - 2)  # (이미지, 글꼴 기준선 위쪽에서의 세로 오프셋)
+        return cache[key]
+
+    def _is_emphasis(self, token: str, scene: ShortsScene) -> bool:
+        core = token.strip(".,!?·…\"'()")
+        return any(core and (core in w or w in core) for w in (scene.emphasis_words or []) if w.strip())
+
+    def _kinetic_layer(self, scene: ShortsScene, has_media: bool, title: str, t: float) -> Optional[Image.Image]:
+        caption = scene.display_caption or ""
+        if not caption:
+            return None
+        # 오프닝 문구가 상단 타이틀과 같으면(키네틱 모드) 화면 중앙에 크게 보여 주는 임팩트 장면으로 사용
+        center = has_media and re.sub(r"\W", "", caption) == re.sub(r"\W", "", title)
+        if center and scene.section_type != "hook":
+            return None
+        if self._big_numbers(scene):
+            return self._big_number_layer(scene, t)
+
+        W = self.WIDTH
+        layer = Image.new("RGBA", (W, self.HEIGHT), (0, 0, 0, 0))
+        base = 84 if center else (62 if has_media else 74)
+        tokens = caption.split()
+        sizes = [int(base * 1.8) if self._is_emphasis(tok, scene) else base for tok in tokens]
+        max_w = W - 160
+        # 강조 단어가 한 줄 폭을 넘으면 그 단어만 축소
+        for i, tok in enumerate(tokens):
+            while display_font(sizes[i], tok).getlength(tok) > max_w and sizes[i] > base:
+                sizes[i] -= 6
+
+        # 크기가 섞인 단어들을 줄 단위로 배치 (기준선 정렬)
+        lines: List[List[int]] = [[]]
+        width = 0.0
+        for i, tok in enumerate(tokens):
+            ww = display_font(sizes[i], tok).getlength(tok)
+            gap = display_font(base).getlength(" ")
+            if lines[-1] and width + gap + ww > max_w:
+                lines.append([])
+                width = 0.0
+            width += (gap if lines[-1] else 0) + ww
+            lines[-1].append(i)
+        lines = lines[:4]
+        line_hs = [int(max(sizes[i] for i in ln) * 1.18) for ln in lines]
+        block_h = sum(line_hs)
+        if center:
+            y0 = 900 - block_h // 2
+        else:
+            y0 = 420 if has_media else (450 + 110 + 1300) // 2 - block_h // 2
+        gap = display_font(base).getlength(" ")
+
+        d = ImageDraw.Draw(layer)
+        if has_media:
+            # 문구 뒤 반투명 배경 (영상 위에서도 읽히도록), 첫 단어와 함께 서서히 나타남
+            a = int(150 * min(1.0, t / 0.3))
+            d.rounded_rectangle([56, y0 - 24, W - 56, y0 + block_h + 24], radius=26, fill=(5, 12, 35, a))
+
+        word_idx = 0
+        y = y0
+        for ln, lh in zip(lines, line_hs):
+            line_w = sum(display_font(sizes[i], tokens[i]).getlength(tokens[i]) for i in ln) + gap * (len(ln) - 1)
+            x = 80.0 if has_media and not center else (W - line_w) / 2
+            baseline = y + int(lh * 0.82)
+            clip_bottom = y + lh + 6
+            for i in ln:
+                emph = self._is_emphasis(tokens[i], scene)
+                img, top_off = self._word_image(tokens[i], sizes[i], "#FFD400" if emph else "#FFFFFF")
+                start = 0.08 + 0.09 * word_idx
+                p = (t - start) / 0.3
+                word_idx += 1
+                font = display_font(sizes[i], tokens[i])
+                ascent = font.getmetrics()[0]
+                final_y = int(baseline - ascent + top_off)
+                ww = font.getlength(tokens[i])
+                if emph:
+                    # 형광펜: 단어가 나타난 뒤 왼쪽→오른쪽으로 칠해짐
+                    mp = self._ease_out((t - start - 0.25) / 0.25)
+                    if mp > 0:
+                        hb_top = baseline - int(sizes[i] * 0.30)
+                        d.rectangle([x - 6, hb_top, x - 6 + (ww + 12) * mp, baseline + int(sizes[i] * 0.10)],
+                                    fill=(37, 99, 235, 210))
+                if p > 0:
+                    e = self._ease_out(p)
+                    dy = int((1 - e) * lh * 0.95)
+                    piece = img
+                    if emph and 0 < p < 1.8:
+                        # 강조 단어는 등장 직후 살짝 커졌다 돌아오는 팝
+                        pop = 1 + 0.14 * max(0.0, 1 - abs(p - 1.1) / 0.6)
+                        if pop > 1.001:
+                            piece = img.resize((int(img.width * pop), int(img.height * pop)), Image.LANCZOS)
+                    px = int(x - (piece.width - img.width) / 2)
+                    py = final_y + dy - (piece.height - img.height) // 2
+                    visible = clip_bottom - py
+                    if visible > 0:
+                        crop = piece.crop((0, 0, piece.width, min(piece.height, visible)))
+                        if p < 0.4:
+                            crop.putalpha(crop.getchannel("A").point(lambda v, f=p / 0.4: int(v * f)))
+                        layer.alpha_composite(crop, (max(0, px), max(0, py)))
+                x += ww + gap
+            y += lh
+        return layer
+
+    def _big_number_layer(self, scene: ShortsScene, t: float) -> Image.Image:
+        """대형 숫자 장면: 중앙 패널 + 작은 설명 + 거대한 숫자(카운트업), 숫자가 2개면 사이에 화살표"""
+        W = self.WIDTH
+        layer = Image.new("RGBA", (W, self.HEIGHT), (0, 0, 0, 0))
+        d = ImageDraw.Draw(layer)
+        nums = self._big_numbers(scene)
+        appear = self._ease_out(t / 0.25)
+        panel = (60, 560, W - 60, 1320)
+        d.rounded_rectangle(panel, radius=36, fill=(5, 12, 35, int(205 * appear)))
+
+        # 위쪽 작은 설명 (문구 전체)
+        small = display_font(44, scene.display_caption or "")
+        sy = panel[1] + 60
+        for line in wrap_text_px(scene.display_caption or "", small, W - 220)[:2]:
+            img, _ = self._word_image(line, 44, "#E2E8F0")
+            if appear > 0:
+                piece = img.copy()
+                piece.putalpha(piece.getchannel("A").point(lambda v: int(v * appear)))
+                layer.alpha_composite(piece, ((W - img.width) // 2, sy))
+            sy += 60
+
+        count = self._ease_out((t - 0.25) / 0.9)
+        rows = []
+        if len(nums) == 2:
+            rows = [(nums[0], 120, "#CBD5E1", 0.25), ("↓", 90, "#FFD400", 0.55), (nums[1], 170, "#FFD400", 0.7)]
+        else:
+            rows = [(nums[0], 190, "#FFD400", 0.25)]
+        total_h = sum(int(sz * 1.15) for _, sz, _, _ in rows)
+        y = (sy + panel[3]) // 2 - total_h // 2
+        for text, size, color, start in rows:
+            if text != "↓":
+                text = self._count_up(text, count) if count < 1 else text
+            while display_font(size, text).getlength(text) > W - 220 and size > 60:
+                size -= 8
+            img, _ = self._word_image(text, size, color)
+            p = (t - start) / 0.35
+            if p > 0:
+                e = self._ease_out(p)
+                scale = 0.6 + 0.4 * e + 0.08 * max(0.0, 1 - abs(p - 1.0) / 0.5)
+                piece = img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale))), Image.LANCZOS)
+                if p < 0.5:
+                    piece.putalpha(piece.getchannel("A").point(lambda v, f=p / 0.5: int(v * f)))
+                cx, cy = W // 2, y + int(size * 1.15) // 2
+                layer.alpha_composite(piece, (cx - piece.width // 2, max(0, cy - piece.height // 2)))
+            y += int(size * 1.15)
+        return layer
+
     def _caption_layer(self, scene: ShortsScene, has_media: bool, title: str, progress: float) -> Optional[Image.Image]:
         """씬 핵심 문구. progress<1 이면 팝업(확대+바운스) + 페이드인 + 아래→위 이동 + 숫자 카운트업"""
         caption = scene.display_caption or ""
@@ -498,7 +724,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         layer = Image.new("RGBA", (W, self.HEIGHT), (0, 0, 0, 0))
         d = ImageDraw.Draw(layer)
         if has_media:
-            font = korean_font(58, "bold")
+            font = display_font(58, caption)
             y = 420
             lines = wrap_text_px(text, font, W - 160)[:2]
             for line in lines:
@@ -508,7 +734,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             box = (80, 450, W - 80, 1300)
             size = 76
             while True:
-                font = korean_font(size, "bold")
+                font = display_font(size, caption)
                 final_lines = wrap_text_px(caption, font, box[2] - box[0] - 120)
                 if len(final_lines) <= 4 or size <= 48:
                     break
@@ -587,10 +813,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         caption_final: Dict[int, Optional[Image.Image]] = {}
         sub_cache: Dict[int, Image.Image] = {}
 
+        anim_lens = [self._anim_len(item["scene"], media_flags[i], title) for i, item in enumerate(timeline)]
         times = {0.0}
-        steps = int(round(self.INTRO_SEC / self.INTRO_STEP))
-        for s0 in starts:
-            for k in range(steps + 1):
+        for s0, length in zip(starts, anim_lens):
+            for k in range(int(round(length / self.INTRO_STEP)) + 1):
                 times.add(round(s0 + k * self.INTRO_STEP, 3))
         for ev in events:
             times.add(round(ev["start"], 3))
@@ -619,13 +845,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 base_cache[si] = Image.alpha_composite(
                     static, self._scene_base_layer(timeline[si]["scene"], si, len(timeline), media_flags[si]))
             frame = base_cache[si]
-            progress = (t - starts[si]) / self.INTRO_SEC
-            if progress >= 1:
+            t_rel = t - starts[si]
+            if t_rel >= anim_lens[si]:
                 if si not in caption_final:
-                    caption_final[si] = self._caption_layer(timeline[si]["scene"], media_flags[si], title, 1.0)
+                    caption_final[si] = self._scene_caption(timeline[si]["scene"], media_flags[si], title, anim_lens[si] + 1)
                 cap = caption_final[si]
             else:
-                cap = self._caption_layer(timeline[si]["scene"], media_flags[si], title, progress)
+                cap = self._scene_caption(timeline[si]["scene"], media_flags[si], title, t_rel)
             if cap is not None:
                 frame = Image.alpha_composite(frame, cap)
             if ev is not None:

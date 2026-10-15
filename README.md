@@ -50,9 +50,26 @@
 | `GEMINI_API_KEY` / `ANTHROPIC_API_KEY` | - | 화면에서 입력하지 않을 때 사용 |
 | `GEMINI_MODEL` | `gemini-flash-latest` | Gemini 기획·미디어 분석 모델 |
 | `CLAUDE_MODEL` | `claude-opus-5-5` | Claude 기획·미디어 분석 모델 |
+| `GEMINI_TTS_MODEL` | `gemini-3.8-flash-tts` (없으면 `gemini-2.5-flash-preview-tts`) | 쇼츠 내레이션 음성 합성 모델 |
 | `GEMINI_IMAGE_MODEL` | `gemini-3.1-flash-image` (없으면 `gemini-2.5-flash-image`) | AI 이미지 생성 모델 |
 
 > 첨부 동영상의 원본 소리는 사용하지 않고 TTS 내레이션으로 대체합니다.
+
+**쇼츠 내레이션·자막 스타일 (렌더링 시점 옵션)**
+- 내레이션: Gemini TTS(톤앤매너에 맞춘 말투·목소리 자동 선택, 결과 캐시로 재렌더링 시 재사용). 키가 없거나 실패하면 macOS Yuna → gTTS로 전체 대체 (Claude API는 음성 생성 미지원)
+- 자막 스타일: **키네틱 타이포**(단어 순차 등장·마스크 리빌, 강조 단어 대형·형광펜, 숫자 장면은 대형 숫자 카운트업) 또는 **기본**(문구 팝업)
+- 공통 모션: 장면별 카메라 무브(줌인·줌아웃·팬·대각선), 오프닝 펀치 줌, 장면 전환, 상단 진행 바
+- **AI 영상화 (Veo, 선택 · 기본 사용 안 함)**: 오프닝 1장면 / 핵심 2장면 / 전체 장면을 Veo 3.1(Lite·Fast·표준)로 실제 움직이는 영상으로 생성.
+  렌더링 전에 예상 비용 확인 창이 뜨며, 생성 결과는 캐시되어 같은 장면을 다시 렌더링해도 추가 과금이 없음.
+  참고 요금(Google 공식, 1080p): Lite $0.08/초 · Fast $0.12/초 · 표준 $0.40/초 (오프닝 1장면 ≈ 8초 → Fast 약 $0.96)
+
+**폰트 (assets/fonts, 배포 번들에 포함)**
+- 타이틀·장면 핵심 문구·강조 단어·대형 숫자·카드 헤드라인: Gmarket Sans Bold (SIL OFL 1.1, `assets/fonts/OFL-GmarketSans.txt`)
+- 하단 말자막·카드 본문: `assets/fonts/Pretendard-*.otf` 가 있으면 Pretendard, 없으면 시스템 한글 폰트(macOS: Apple SD Gothic Neo)
+
+**배포(flet build / flet pack)**
+- 폰트 등 리소스는 `assets/` → 배포 번들에 포함 (`flet pack main.py --add-data "assets:assets"`)
+- 결과물·업로드·로그는 배포 앱에서 운영체제의 앱 데이터 폴더(`FLET_APP_STORAGE_DATA`)에 저장 (설치 폴더는 읽기 전용)
 
 ---
 

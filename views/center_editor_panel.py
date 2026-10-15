@@ -273,6 +273,13 @@ class CenterEditorPanel(ft.Container):
                 controls=[
                     self._asset_picker(scene, allow=True),
                     tf_caption,
+                    ft.TextField(
+                        label="강조 단어 (키네틱 타이포에서 크게 표시, 쉼표로 구분)",
+                        value=", ".join(scene.emphasis_words), text_size=12, dense=True,
+                        border_color=StitchColors.BORDER_DEFAULT,
+                        on_change=lambda e, sc=scene: setattr(
+                            sc, "emphasis_words", [w.strip() for w in (e.control.value or "").split(",") if w.strip()][:2]),
+                    ),
                     tf_narration,
                 ],
                 spacing=8,

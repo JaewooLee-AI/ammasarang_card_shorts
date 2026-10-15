@@ -291,7 +291,7 @@ class RightPreviewPanel(ft.Container):
         """웹 모드는 assets_dir(exports) 기준 URL, 데스크톱은 로컬 절대경로 사용"""
         if self.app_page and self.app_page.web:
             rel = os.path.relpath(video_path, self.exports_dir).replace(os.sep, "/")
-            return f"/{rel}?v={int(os.path.getmtime(video_path))}"
+            return f"/exports/{rel}?v={int(os.path.getmtime(video_path))}"
         return video_path
 
     def set_shorts_video(self, video_path: str):

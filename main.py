@@ -13,25 +13,22 @@ from services.shorts_renderer import ShortsRendererService
 from services.media_assets import MediaLibrary
 from services.image_generator import AIImageGenerator
 from services import downloads
+from services.veo_video import VeoGenerator, VEO_MODELS, SCOPES, estimate as veo_estimate
 from models.schema import UserRequestPayload, EditableStoryboard
 
 from views.left_input_panel import LeftInputPanel
 from views.center_editor_panel import CenterEditorPanel
 from views.right_preview_panel import RightPreviewPanel
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# 생성 결과물 폴더를 Flet assets_dir로 지정 → 웹 모드에서 영상 등을 URL로 서빙
-EXPORTS_DIR = os.path.join(BASE_DIR, "exports")
-os.makedirs(os.path.join(EXPORTS_DIR, "cards"), exist_ok=True)
-os.makedirs(os.path.join(EXPORTS_DIR, "shorts"), exist_ok=True)
-# 웹 모드 파일 업로드 저장 위치 (Flet 업로드에는 FLET_SECRET_KEY가 필요)
-UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+from services.paths import BASE_DIR, ASSETS_DIR, FONTS_DIR, EXPORTS_DIR, UPLOAD_DIR, LOG_DIR
+
+# 경로 규칙 (services/paths.py)
+# - assets/ : 폰트 등 읽기 전용 리소스 → Flet assets_dir (배포 번들에 포함)
+# - exports/ uploads/ logs/ : 결과물·업로드·로그 → 배포 앱에서는 운영체제의 앱 데이터 폴더(FLET_APP_STORAGE_DATA)
+# 웹 모드 파일 업로드에는 FLET_SECRET_KEY가 필요
 os.environ.setdefault("FLET_SECRET_KEY", secrets.token_hex(16))
 
 # 오류 추적용 로그 파일 (서버 콘솔 출력이 버퍼링되어도 원인을 확인할 수 있도록)
-LOG_DIR = os.path.join(BASE_DIR, "logs")
-os.makedirs(LOG_DIR, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -48,6 +45,16 @@ async def main(page: ft.Page):
     page.theme_mode = ft.ThemeMode.LIGHT
     page.bgcolor = StitchColors.CANVAS
     page.padding = 0
+
+    # 번들 폰트를 앱 화면에도 등록 (assets/fonts → 배포 파일에 포함)
+    app_fonts = {}
+    if os.path.exists(os.path.join(FONTS_DIR, "GmarketSansBold.otf")):
+        app_fonts["Gmarket Sans"] = "/fonts/GmarketSansBold.otf"
+    if os.path.exists(os.path.join(FONTS_DIR, "Pretendard-Regular.otf")):
+        app_fonts["Pretendard"] = "/fonts/Pretendard-Regular.otf"
+    page.fonts = app_fonts
+    if "Pretendard" in app_fonts:
+        page.theme = ft.Theme(font_family="Pretendard")
     page.window.width = 1480
     page.window.height = 960
     page.window.min_width = 1200
@@ -66,6 +73,7 @@ async def main(page: ft.Page):
     shorts_renderer = ShortsRendererService(export_dir=os.path.join(EXPORTS_DIR, "shorts"))
     media_library = MediaLibrary(EXPORTS_DIR)
     image_generator = AIImageGenerator(media_library)
+    veo_generator = VeoGenerator(media_library, os.path.join(EXPORTS_DIR, "shorts", "veo_cache"))
 
     # 3. 상단 글로벌 네비게이션 헤더 (Stitch Midnight Slate & Civic Navy)
     status_scenario_badge = create_badge("첨부 0개", StitchColors.PRIMARY_CONTAINER, StitchColors.ON_PRIMARY)
@@ -87,7 +95,9 @@ async def main(page: ft.Page):
                             controls=[
                                 ft.Row(
                                     controls=[
-                                        ft.Text("안마사랑 AI 콘텐츠 스튜디오", size=18, weight=ft.FontWeight.W_800, color=StitchColors.TEXT_ON_DARK),
+                                        ft.Text("안마사랑 AI 콘텐츠 스튜디오", size=19, color=StitchColors.TEXT_ON_DARK,
+                                                font_family="Gmarket Sans" if "Gmarket Sans" in app_fonts else None,
+                                                weight=None if "Gmarket Sans" in app_fonts else ft.FontWeight.W_800),
                                     ],
                                     spacing=8,
                                 ),
@@ -169,6 +179,7 @@ async def main(page: ft.Page):
             storyboard.fact_check_log.extend(await image_generator.fill_missing(storyboard, payload, image_progress))
             center_panel.load_storyboard(storyboard)
             right_panel.update_sns_package(storyboard)
+            left_panel.refresh_veo_estimate(storyboard)
 
             # 실제로 사용된 엔진과 팩트 락 결과를 헤더에 표시 (API 실패 시 폴백 여부가 드러나도록)
             status_ai_badge.content.controls[-1].value = f"AI: {storyboard.engine}"
@@ -205,24 +216,68 @@ async def main(page: ft.Page):
             center_panel.set_loading(False, f"카드뉴스 렌더링 실패: {ex}")
             toast(f"카드뉴스 렌더링 실패: {ex}", StitchColors.ERROR)
 
+    async def confirm(title: str, message: str, ok_label: str) -> bool:
+        """비용이 드는 작업 전 확인 대화상자"""
+        fut = asyncio.get_running_loop().create_future()
+
+        def close(result: bool):
+            if not fut.done():
+                fut.set_result(result)
+            page.pop_dialog()
+
+        page.show_dialog(ft.AlertDialog(
+            modal=True,
+            title=ft.Text(title),
+            content=ft.Text(message),
+            actions=[ft.TextButton("취소", on_click=lambda e: close(False)),
+                     ft.Button(ok_label, on_click=lambda e: close(True))],
+            on_dismiss=lambda e: (not fut.done()) and fut.set_result(False),
+        ))
+        return await fut
+
     async def on_render_shorts(storyboard: EditableStoryboard):
         if not storyboard:
             return
+        opts = left_panel.shorts_options()
+        veo_logs = []
+        if opts.veo_scope != "none":
+            secs, cost = veo_estimate(storyboard, opts.veo_scope, opts.veo_quality)
+            label = VEO_MODELS[opts.veo_quality][1]
+            if secs and not await confirm(
+                "Veo AI 영상 생성",
+                f"범위: {SCOPES[opts.veo_scope]}\n모델: {label} (1080p)\n생성 길이: 약 {secs}초\n"
+                f"예상 비용: 약 ${cost:.2f} (생성 성공 시에만 과금, 이미 만든 장면은 재사용)\n소요 시간: 클립당 1~3분",
+                "생성 진행",
+            ):
+                center_panel.set_loading(False, "Veo 영상 생성을 취소했습니다. (AI 영상화 옵션을 '사용 안 함'으로 바꾸면 바로 렌더링됩니다)")
+                return
+
         center_panel.set_loading(True, "쇼츠 오디오 합성 및 ASS 노래방식 자막 비디오 인코딩 중...")
 
         async def shorts_progress(pct: float, msg: str):
             center_panel.set_loading(True, f"[{int(pct*100)}%] {msg}")
 
+        async def veo_progress(msg: str):
+            center_panel.set_loading(True, msg)
+
         try:
-            mp4_path = await shorts_renderer.render_shorts_video(storyboard, shorts_progress)
+            if opts.veo_scope != "none":
+                clips, veo_logs = await veo_generator.generate(
+                    storyboard, opts.veo_scope, opts.veo_quality, opts.gemini_api_key,
+                    {i: sc.duration_seconds for i, sc in enumerate(storyboard.shorts_scenes)}, veo_progress)
+                opts.video_overrides = clips
+                storyboard.fact_check_log.extend(veo_logs)
+            mp4_path = await shorts_renderer.render_shorts_video(storyboard, shorts_progress, opts)
             right_panel.set_shorts_video(mp4_path)
             reveal_preview()
             warnings = shorts_renderer.last_warnings
             if warnings:
-                center_panel.set_loading(False, "쇼츠 렌더링 완료 (경고: " + " / ".join(warnings) + ")")
+                center_panel.set_loading(False, "쇼츠 렌더링 완료 (경고: " + " / ".join(warnings) + ")"
+                                         + (" · " + veo_logs[0] if veo_logs else ""))
                 toast("🎬 쇼츠가 생성되었지만 경고가 있습니다: " + warnings[0], StitchColors.WARNING)
             else:
-                center_panel.set_loading(False, "쇼츠 비디오 (9:16) 렌더링 완료! (exports/shorts/final_shorts.mp4)")
+                center_panel.set_loading(False, f"쇼츠 비디오 (9:16) 렌더링 완료! 음성: {shorts_renderer.last_tts_engine}"
+                                         + (" · " + " / ".join(veo_logs) if veo_logs else ""))
                 toast("🎬 9:16 세로형 쇼츠 동영상이 생성되었습니다!")
         except Exception as ex:
             logger.exception("쇼츠 렌더링 실패")
@@ -297,8 +352,12 @@ async def main(page: ft.Page):
 
 def create_web_app():
     """웹 모드 ASGI 앱 (+ 결과물 다운로드 라우트)"""
-    app = ft.run(main, export_asgi_app=True, assets_dir=EXPORTS_DIR, upload_dir=UPLOAD_DIR)
+    from starlette.routing import Mount
+    from starlette.staticfiles import StaticFiles
+    app = ft.run(main, export_asgi_app=True, assets_dir=ASSETS_DIR, upload_dir=UPLOAD_DIR)
     downloads.register_routes(app, EXPORTS_DIR)
+    # 결과물(쇼츠 영상 미리보기 등)은 /exports 경로로 서빙 — Flet 정적 파일 처리보다 먼저 매칭되도록 맨 앞에 삽입
+    app.router.routes.insert(0, Mount("/exports", app=StaticFiles(directory=EXPORTS_DIR), name="exports"))
     return app
 
 
@@ -306,7 +365,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8550"))
     view_mode = os.environ.get("FLET_VIEW", "web").lower()
     if view_mode == "app":
-        ft.run(main, view=ft.AppView.FLET_APP, assets_dir=EXPORTS_DIR, upload_dir=UPLOAD_DIR)
+        ft.run(main, view=ft.AppView.FLET_APP, assets_dir=ASSETS_DIR, upload_dir=UPLOAD_DIR)
     else:
         import uvicorn
         logger.info(f"안마사랑 AI 콘텐츠 스튜디오 시작: http://localhost:{port}")

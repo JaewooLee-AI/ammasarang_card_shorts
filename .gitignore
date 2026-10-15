@@ -20,3 +20,6 @@ keys.json
 
 # 비공개 사업 데이터 (예시 시나리오)
 data/scenarios.json
+
+# flet run 개발 모드 저장소
+.flet/

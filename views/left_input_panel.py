@@ -5,6 +5,8 @@ import flet as ft
 from services.stitch_theme import StitchColors, create_badge, create_card_container
 from services.media_assets import MediaLibrary, ALLOWED_EXTENSIONS, media_kind
 from services import key_store
+from services.tts_gemini import VOICE_OPTIONS
+from services import veo_video
 from models.schema import UserRequestPayload, MediaAsset
 
 
@@ -114,6 +116,33 @@ class LeftInputPanel(ft.Container):
             options=[ft.dropdown.Option(str(n), f"약 {n}초") for n in (30, 45, 60)],
             value="45", dense=True, text_size=12, width=150, border_color=StitchColors.BORDER_DEFAULT,
         )
+        self.caption_style_dropdown = ft.Dropdown(
+            label="쇼츠 자막 스타일",
+            options=[ft.dropdown.Option("kinetic", "키네틱 타이포 (단어 순차 등장·강조·대형 숫자)"),
+                     ft.dropdown.Option("basic", "기본 (문구 팝업)")],
+            value="kinetic", dense=True, text_size=12, border_color=StitchColors.BORDER_DEFAULT,
+        )
+        # Veo AI 영상화 (선택, 기본: 사용 안 함)
+        self.current_storyboard = None
+        self.veo_scope_dropdown = ft.Dropdown(
+            label="AI 영상화 범위 (Veo)",
+            options=[ft.dropdown.Option(k, v) for k, v in veo_video.SCOPES.items()],
+            value="none", dense=True, text_size=12, border_color=StitchColors.BORDER_DEFAULT,
+            on_select=lambda e: self.refresh_veo_estimate(),
+        )
+        self.veo_quality_dropdown = ft.Dropdown(
+            label="Veo 모델",
+            options=[ft.dropdown.Option(k, f"{label} · ${price:.2f}/초") for k, (_, label, price) in veo_video.VEO_MODELS.items()],
+            value="fast", dense=True, text_size=12, border_color=StitchColors.BORDER_DEFAULT,
+            on_select=lambda e: self.refresh_veo_estimate(),
+        )
+        self.veo_estimate_text = ft.Text("", size=11, color=StitchColors.TEXT_MUTED)
+
+        self.voice_dropdown = ft.Dropdown(
+            label="내레이션 목소리 (Gemini TTS)",
+            options=[ft.dropdown.Option(v, label) for label, v in VOICE_OPTIONS.items()],
+            value="auto", dense=True, text_size=12, border_color=StitchColors.BORDER_DEFAULT,
+        )
         self.ai_image_switch = ft.Switch(
             label="에셋이 부족한 장면은 AI 이미지 생성 (Gemini)",
             value=True, active_color=StitchColors.PRIMARY_CONTAINER,
@@ -207,10 +236,35 @@ class LeftInputPanel(ft.Container):
                             self.tone_dropdown,
                             self.style_dropdown,
                             self.ai_image_switch,
+                            self.caption_style_dropdown,
+                            self.voice_dropdown,
+                            ft.Text("※ 자막 스타일·목소리는 렌더링할 때 적용되므로 다시 기획하지 않고 바꿔 렌더링할 수 있습니다.",
+                                    size=11, color=StitchColors.TEXT_MUTED),
                         ],
                         spacing=10,
                     ),
                     title="생성 옵션",
+                    padding=12,
+                ),
+                create_card_container(
+                    content=ft.Column(
+                        controls=[
+                            self.veo_scope_dropdown,
+                            self.veo_quality_dropdown,
+                            self.veo_estimate_text,
+                            ft.Text(
+                                "참고 요금 (Google 공식, 1080p, 생성 성공 시에만 과금)\n"
+                                "· Lite $0.08/초 · Fast $0.12/초 · 표준 $0.40/초\n"
+                                "· 오프닝 1장면 ≈ 8초 → Fast 약 $0.96\n"
+                                "· 핵심 2장면 ≈ 16초 → Fast 약 $1.92\n"
+                                "· 전체 45초 쇼츠 ≈ 44초 → Fast 약 $5.28\n"
+                                "· 클립당 1~3분 소요, 같은 장면을 다시 렌더링하면 재사용(추가 과금 없음)",
+                                size=11, color=StitchColors.TEXT_MUTED,
+                            ),
+                        ],
+                        spacing=8,
+                    ),
+                    title="AI 영상화 (Veo, 선택)",
                     padding=12,
                 ),
                 create_card_container(
@@ -245,6 +299,8 @@ class LeftInputPanel(ft.Container):
         )
 
         self.content = ft.Column(controls=[header_section, scrollable_body], spacing=8, expand=True)
+        self.shorts_len_dropdown.on_select = lambda e: self.refresh_veo_estimate()
+        self.refresh_veo_estimate()
 
     def _safe_update(self, ctrl=None):
         try:
@@ -442,6 +498,31 @@ class LeftInputPanel(ft.Container):
         self.anthropic_key_status.value = ""
         self._safe_update()
         self.app_page.show_dialog(ft.SnackBar(content=ft.Text("저장된 API 키를 삭제했습니다."), bgcolor=StitchColors.PRIMARY_CONTAINER))
+
+    def refresh_veo_estimate(self, storyboard=None):
+        """선택한 범위·모델의 예상 비용 표시 (스토리보드가 있으면 장면별 예상 길이 기준)"""
+        if storyboard is not None:
+            self.current_storyboard = storyboard
+        scope = self.veo_scope_dropdown.value or "none"
+        quality = self.veo_quality_dropdown.value or "fast"
+        if scope == "none":
+            self.veo_estimate_text.value = "현재 방식(이미지 줌·팬)으로 렌더링합니다. 추가 비용 없음."
+            self.veo_estimate_text.color = StitchColors.TEXT_MUTED
+        else:
+            secs, cost = veo_video.estimate(self.current_storyboard, scope, quality, int(self.shorts_len_dropdown.value or 45))
+            basis = "현재 스토리보드 기준" if self.current_storyboard else "쇼츠 길이 기준 추정"
+            self.veo_estimate_text.value = f"💰 예상 비용: 약 ${cost:.2f} ({secs}초 생성, {basis})"
+            self.veo_estimate_text.color = StitchColors.WARNING
+        self._safe_update(self.veo_estimate_text)
+
+    def shorts_options(self):
+        """쇼츠 렌더링 시점 옵션 (입력란 키 → 환경변수 → 저장된 키 순)"""
+        from services.shorts_renderer import ShortsOptions
+        key = (self.gemini_key_field.value or "").strip() or os.environ.get("GEMINI_API_KEY") or key_store.load_keys().get("gemini")
+        return ShortsOptions(veo_scope=self.veo_scope_dropdown.value or "none",
+                             veo_quality=self.veo_quality_dropdown.value or "fast",
+                             caption_style=self.caption_style_dropdown.value or "kinetic",
+                             voice=self.voice_dropdown.value or "auto", gemini_api_key=key)
 
     # ------------------------------------------------------------------
     def _handle_generate_click(self, e):
