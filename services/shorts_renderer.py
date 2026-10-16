@@ -4,6 +4,8 @@ import re
 import shutil
 import asyncio
 import subprocess
+import glob
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
@@ -24,6 +26,9 @@ class ShortsOptions:
     veo_scope: str = "none"             # none | opening | key2 | all  (Veo AI 영상화 범위)
     veo_quality: str = "fast"           # lite | fast | standard
     video_overrides: Optional[Dict[int, MediaAsset]] = None  # {장면 인덱스: Veo 동영상} — 해당 장면 배경만 교체
+
+
+OUTPUT_PREFIX = "final_shorts"  # 결과 파일: final_shorts_<시각>.mp4 (downloads.shorts_file 이 최신 파일을 찾음)
 
 
 class ShortsRendererService:
@@ -65,7 +70,9 @@ class ShortsRendererService:
 
         self.last_warnings = []
         self.options = options or ShortsOptions()
-        output_mp4 = os.path.join(self.export_dir, "final_shorts.mp4")
+        # 매번 새 파일명으로 저장: Windows에서는 미리보기 플레이어가 열어 둔 이전 영상을 덮어쓸 수 없음(WinError 5)
+        self._remove_old_outputs()
+        output_mp4 = os.path.join(self.export_dir, f"{OUTPUT_PREFIX}_{datetime.now():%Y%m%d_%H%M%S_%f}.mp4")
         audio_path = os.path.join(self.export_dir, "combined_narration.mp3")
         ass_path = os.path.join(self.export_dir, "captions.ass")
         bg_path = os.path.join(self.export_dir, "shorts_bg.png")
@@ -908,4 +915,20 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         await self._run(cmd, "FFmpeg 인코딩 실패")
         if await self._get_audio_duration(tmp_out) <= 0:
             raise RuntimeError("FFmpeg 출력 파일이 비어 있습니다.")
-        os.replace(tmp_out, output_mp4)
+        # 백신 검사 등으로 방금 만든 파일이 잠시 잠겨 있을 수 있어 몇 번 재시도
+        for attempt in range(10):
+            try:
+                os.replace(tmp_out, output_mp4)
+                break
+            except PermissionError:
+                if attempt == 9:
+                    raise
+                await asyncio.sleep(0.5)
+
+    def _remove_old_outputs(self):
+        """이전 렌더링 결과 정리 — 미리보기에서 재생 중이라 잠긴 파일은 건너뛰고 다음 렌더링 때 정리"""
+        for path in glob.glob(os.path.join(self.export_dir, f"{OUTPUT_PREFIX}*.mp4")):
+            try:
+                os.remove(path)
+            except OSError:
+                pass

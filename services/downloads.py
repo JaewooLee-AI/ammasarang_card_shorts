@@ -19,8 +19,9 @@ def card_files(exports_dir: str) -> list:
 
 
 def shorts_file(exports_dir: str) -> Optional[str]:
-    path = os.path.join(exports_dir, "shorts", "final_shorts.mp4")
-    return path if os.path.exists(path) else None
+    """가장 최근에 렌더링된 쇼츠 영상 (final_shorts_<시각>.mp4, 인코딩 중인 .part.mp4 제외)"""
+    paths = [p for p in glob.glob(os.path.join(exports_dir, "shorts", "final_shorts*.mp4")) if not p.endswith(".part.mp4")]
+    return max(paths, key=os.path.getmtime) if paths else None
 
 
 def build_cards_zip(exports_dir: str) -> bytes:
