@@ -108,12 +108,12 @@ class LeftInputPanel(ft.Container):
         )
         self.card_count_dropdown = ft.Dropdown(
             label="카드뉴스 장수",
-            options=[ft.dropdown.Option(str(n), f"{n}장") for n in range(5, 11)],
+            options=[ft.dropdown.Option("3", "3장 (테스트)")] + [ft.dropdown.Option(str(n), f"{n}장") for n in range(5, 11)],
             value="7", dense=True, text_size=12, width=150, border_color=StitchColors.BORDER_DEFAULT,
         )
         self.shorts_len_dropdown = ft.Dropdown(
             label="쇼츠 길이",
-            options=[ft.dropdown.Option(str(n), f"약 {n}초") for n in (30, 45, 60)],
+            options=[ft.dropdown.Option("15", "약 15초 (테스트)")] + [ft.dropdown.Option(str(n), f"약 {n}초") for n in (30, 45, 60)],
             value="45", dense=True, text_size=12, width=150, border_color=StitchColors.BORDER_DEFAULT,
         )
         self.caption_style_dropdown = ft.Dropdown(

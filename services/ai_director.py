@@ -20,6 +20,7 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 
 HOTLINE = "1577-1398"
 WEBSITE = "anmasarang.com"
+SHORT_SHORTS_SECONDS = 20  # 이 길이 이하(테스트용 15초)면 쇼츠를 3씬으로 구성
 
 
 # ---------------------------------------------------------------------------
@@ -535,7 +536,7 @@ class AIDirectorService:
 [작성 규칙]:
 - 카드뉴스 {payload.card_count}장: 1장 cover, 중간은 body(수치 비교가 있으면 1장은 comparison_table + comparison_rows 작성), 마지막 장 call_to_action
 - 각 lead_headline은 40자 이내, body_content는 줄바꿈으로 구분된 3~4줄, takeaway는 30자 이내
-- 쇼츠 4~6씬, 전체 내레이션 {payload.shorts_seconds}초 내외(한국어 초당 약 6~7자): 첫 씬 hook, 중간 body, 마지막 씬 conclusion. display_caption은 30자 이내
+- 쇼츠 {"3씬" if payload.shorts_seconds <= SHORT_SHORTS_SECONDS else "4~6씬"}, 전체 내레이션 {payload.shorts_seconds}초 내외(한국어 초당 약 6~7자): 첫 씬 hook, 중간 body, 마지막 씬 conclusion. display_caption은 30자 이내
 - 각 씬의 emphasis_words에는 display_caption 속 핵심 단어 1~2개(숫자·금액·핵심 명사)를 문구에 적힌 그대로 넣을 것
 {asset_rule}
 - image_prompt/visual_motion_prompt는 이미지 안에 글자가 들어가지 않는 장면 묘사로 작성
@@ -662,13 +663,24 @@ class AIDirectorService:
         def section_head(sentences: List[str], tag: str) -> str:
             head = self._headline(sentences[0]) if sentences else section_labels[tag]
             return section_labels[tag] if head.rstrip("…") in cover_headline else head
-        scenes = [
-            scene(1, "hook", f"{hook_intro} {core_title}.".strip(), core_title, "Fast zoom-in hook with bold title"),
-            scene(2, "body", within(sit), section_head(sit, "상황"), "problem situation"),
-            scene(3, "body", within(dev), section_head(dev, "전개"), "solution in action"),
-            scene(4, "body", within(res), section_head(res, "결과"), "positive outcome"),
-            scene(5, "conclusion", pack["cta_narration"], f"상담 {HOTLINE}", "Call-to-action end card"),
-        ]
+        hook = scene(1, "hook", f"{hook_intro} {core_title}.".strip(), core_title, "Fast zoom-in hook with bold title")
+        if payload.shorts_seconds <= SHORT_SHORTS_SECONDS:
+            # 짧은 쇼츠(테스트용 15초): 훅 → 결과 → CTA 3씬, 본문 예산을 한 씬에 몰아줌
+            body_budget *= 3
+            key = res or dev or sit
+            scenes = [
+                hook,
+                scene(2, "body", within(key), section_head(key, "결과" if res else "전개" if dev else "상황"), "positive outcome"),
+                scene(3, "conclusion", pack["cta_narration"], f"상담 {HOTLINE}", "Call-to-action end card"),
+            ]
+        else:
+            scenes = [
+                hook,
+                scene(2, "body", within(sit), section_head(sit, "상황"), "problem situation"),
+                scene(3, "body", within(dev), section_head(dev, "전개"), "solution in action"),
+                scene(4, "body", within(res), section_head(res, "결과"), "positive outcome"),
+                scene(5, "conclusion", pack["cta_narration"], f"상담 {HOTLINE}", "Call-to-action end card"),
+            ]
 
         bullets = "\n".join(f"✔️ {v}" for v in fact_values) or "\n".join(f"✔️ {self._headline(x[0], 40)}" for x in (sit, dev, res) if x)
         sns_caption = (
@@ -704,8 +716,8 @@ class AIDirectorService:
                 "제약: 이미지 안에 글자·숫자·로고·워터마크를 넣지 말 것.")
 
     def _fit_card_count(self, slides: List[CardSlide], count: int, sentences: List[str]) -> List[CardSlide]:
-        """요청 장수(5~10장)에 맞춰 보조 슬라이드를 빼거나 '현장 스케치' 슬라이드를 추가"""
-        count = max(5, min(10, count or 7))
+        """요청 장수(3~10장)에 맞춰 보조 슬라이드를 빼거나 '현장 스케치' 슬라이드를 추가"""
+        count = max(3, min(10, count or 7))
         why_heads = {p["why_headline"] for p in CLUSTER_PACKS.values()}
         removable_checks = [
             lambda sl: sl.slide_type == "body" and sl.lead_headline in why_heads,
@@ -715,6 +727,9 @@ class AIDirectorService:
             if len(slides) <= count:
                 break
             slides = [sl for sl in slides if not check(sl)]
+        # 그래도 많으면(테스트용 3~4장) 표지 다음의 본문 슬라이드부터 제거 → 표지·결과·CTA 순으로 남김
+        while len(slides) > count and len(slides) > 2:
+            slides.pop(1)
         extra_idx = 0
         while len(slides) < count:
             sent = sentences[extra_idx % len(sentences)] if sentences else "안마사랑 헬스키퍼 현장"

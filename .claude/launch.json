@@ -6,6 +6,12 @@
       "runtimeExecutable": ".venv/bin/python",
       "runtimeArgs": ["main.py"],
       "port": 8550
+    },
+    {
+      "name": "anmasarang-studio-win",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": ["main.py"],
+      "port": 8550
     }
   ]
 }
