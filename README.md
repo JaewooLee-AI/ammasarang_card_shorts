@@ -77,6 +77,7 @@
 - `main` 푸시·PR·수동 실행(Actions → Build Windows → Run workflow): 빌드된 zip을 Actions 실행 결과의 Artifacts에서 다운로드
 - `v*` 태그 푸시 시 GitHub Release에 zip 자동 첨부: `git tag v1.0.0 && git push origin v1.0.0` (태그 숫자가 앱 버전이 됨)
 - 결과물 `AnmasarangStudio-windows-x64-<버전>.zip`: 압축을 풀고 `AnmasarangStudio.exe` 실행 (x64, ARM 윈도우에서도 동작)
+- 압축은 탐색기에서 드래그·복사하지 말고 **오른쪽 클릭 → 모두 압축 풀기**(또는 7-Zip)로 `C:\Anmasarang` 같은 짧은 경로에 풀 것 — 탐색기 zip 복사는 260자 넘는 경로의 파일을 복사하지 못함(오류 0x80004005)
 - FFmpeg/ffprobe(gyan.dev essentials 빌드, GPL)를 `ffmpeg\` 폴더에 함께 배포 → 사용자 PC에 FFmpeg 설치 불필요
 - 로컬 빌드: `powershell -ExecutionPolicy Bypass -File .\build_windows.ps1` (Visual Studio 2022 "C++를 사용한 데스크톱 개발" 필요, Flutter SDK는 자동 설치)
 - 비공개 예시 데이터(`data/`)는 배포 번들에서 제외

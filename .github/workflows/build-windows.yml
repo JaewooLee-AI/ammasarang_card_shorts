@@ -85,21 +85,25 @@ jobs:
           Copy-Item "$($src.FullName)\LICENSE" "$dst\LICENSE.txt"
           & "$dst\ffmpeg.exe" -hide_banner -version | Select-Object -First 1
 
-      - name: 압축
+      - name: 빌드 결과 확인
         id: pkg
         run: |
           if (-not (Test-Path "build\windows\AnmasarangStudio.exe")) { throw "AnmasarangStudio.exe가 없습니다: $(Get-ChildItem build\windows -Name)" }
-          $name = "AnmasarangStudio-windows-x64-${{ steps.ver.outputs.version }}"
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Compress-Archive -Path "build\windows\*" -DestinationPath "dist\$name.zip"
-          "name=$name" >> $env:GITHUB_OUTPUT
-          Get-Item "dist\$name.zip" | Format-Table Name, Length
+          "name=AnmasarangStudio-windows-x64-${{ steps.ver.outputs.version }}" >> $env:GITHUB_OUTPUT
 
+      # 빌드 폴더를 그대로 업로드 — Actions가 한 번만 압축하므로 받은 zip을 풀면 바로 AnmasarangStudio.exe가 나옴
+      # (zip 파일을 올리면 Actions가 그 zip을 다시 압축해 zip 안에 zip이 생김)
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.pkg.outputs.name }}
-          path: dist/${{ steps.pkg.outputs.name }}.zip
+          path: build/windows/
           retention-days: 30
+
+      - name: Release용 압축 (태그 빌드)
+        if: github.ref_type == 'tag'
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path "build\windows\*" -DestinationPath "dist\${{ steps.pkg.outputs.name }}.zip"
 
       - name: GitHub Release 첨부 (태그 빌드)
         if: github.ref_type == 'tag'
